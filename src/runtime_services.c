@@ -426,6 +426,11 @@ static const RuntimeExport exports[]={
     {"sceNetCtlRegisterCallback",netctl_register}, {"sceNetCtlCheckCallback",netctl_check},
     {"sceNetCtlUnregisterCallback",netctl_unregister}, {"sceNetCtlGetNatInfo",netctl_nat},
     {"sceNetCtlInit",ok_void}, {"sceNetCtlTerm",ok_void}, {"sceNetResolverAbort",ok_void},  /* bbport-ctr */
+    {"sceNetCtlRegisterCallbackForNpToolkit",netctl_register},       /* bbport-ctr */
+    {"sceNetCtlCheckCallbackForNpToolkit",netctl_check},             /* bbport-ctr */
+    {"sceNetCtlUnregisterCallbackForNpToolkit",netctl_unregister},   /* bbport-ctr */
+    {"sceNetCtlGetStateForNpToolkit",netctl_state},                  /* bbport-ctr */
+    {"sceNetCtlGetInfoForNpToolkit",netctl_info},                    /* bbport-ctr */
     {"sceSslInit",lib_init_id}, {"sceSslTerm",ok_void},
     {"sceHttpInit",lib_init_id}, {"sceHttpTerm",ok_void},
     {"sceHttpCreateTemplate",http_object}, {"sceHttpDeleteTemplate",ok_void},
