@@ -431,6 +431,8 @@ static const RuntimeExport exports[]={
     {"sceNetCtlUnregisterCallbackForNpToolkit",netctl_unregister},   /* bbport-ctr */
     {"sceNetCtlGetStateForNpToolkit",netctl_state},                  /* bbport-ctr */
     {"sceNetCtlGetInfoForNpToolkit",netctl_info},                    /* bbport-ctr */
+    {"sceUserServiceRegisterEventCallback",ok_void},                 /* bbport-ctr */
+    {"sceUserServiceUnregisterEventCallback",ok_void},               /* bbport-ctr */
     {"sceSslInit",lib_init_id}, {"sceSslTerm",ok_void},
     {"sceHttpInit",lib_init_id}, {"sceHttpTerm",ok_void},
     {"sceHttpCreateTemplate",http_object}, {"sceHttpDeleteTemplate",ok_void},
