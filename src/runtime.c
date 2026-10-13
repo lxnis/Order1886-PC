@@ -201,7 +201,7 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     runtime_report();
     exit(status);
 }
-uintptr_t runtime_resolve(const char *name, int is_data) {
+static uintptr_t resolve_exact(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
     if (is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
@@ -260,13 +260,41 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (file) return file;
     return bbgpu_resolve(name);
 }
+/* bbport-ctr: newer libc.prx builds import POSIX functions from libkernel (#p#J);
+ * the runtime knows them under the libScePosix spelling (#I#J) of the same NID. */
+uintptr_t runtime_resolve(const char *name, int is_data) {
+    uintptr_t found=resolve_exact(name,is_data);
+    if (found) return found;
+    size_t n=strlen(name);
+    if (n>4 && n<128 && !strcmp(name+n-4,"#p#J")) {
+        char alt[128];
+        memcpy(alt,name,n-4);
+        memcpy(alt+n-4,"#I#J",5);
+        return resolve_exact(alt,is_data);
+    }
+    return 0;
+}
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"
 };
 /* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
-const char *runtime_symbol(const char *nid) {
+static const char *symbol_exact(const char *nid) {
     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+    return NULL;
+}
+const char *runtime_symbol(const char *nid) {
+    const char *symbol=symbol_exact(nid);
+    if (symbol) return symbol;
+    /* bbport-ctr: POSIX functions imported from libkernel (#p#J) by newer libc.prx
+     * builds use the libScePosix spelling (#I#J) of the same NID. */
+    size_t n=strlen(nid);
+    if (n>4 && n<128 && !strcmp(nid+n-4,"#p#J")) {
+        char alt[128];
+        memcpy(alt,nid,n-4);
+        memcpy(alt+n-4,"#I#J",5);
+        return symbol_exact(alt);
+    }
     return NULL;
 }
 /* Same symbol name means same contract whether imported from libkernel or
