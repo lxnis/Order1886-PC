@@ -330,6 +330,55 @@ static ABI int32_t playgo_locus(int32_t handle,const uint16_t *ids,uint32_t coun
     return 0;
 }
 static ABI int32_t playgo_speed(int32_t handle,int32_t speed) { (void)speed; return handle==playgo_handle && handle ? 0 : PLAYGO_BAD_HANDLE; }
+/* bbport-ctr: the rest of PlayGo that CTR imports. Everything is installed locally. */
+typedef struct { uint64_t progress_size, total_size; } GuestPlayGoProgress;
+_Static_assert(sizeof(GuestPlayGoProgress)==16,"PS4 PlayGo progress layout");
+static int playgo_ok(int32_t handle) { return handle && handle==playgo_handle; }
+static ABI int32_t playgo_get_speed(int32_t handle,int32_t *speed) {
+    if (!playgo_ok(handle)) return PLAYGO_BAD_HANDLE;
+    if (!speed) return PLAYGO_BAD_POINTER;
+    *speed=2; /* FULL */
+    return 0;
+}
+static ABI int32_t playgo_get_eta(int32_t handle,const uint16_t *ids,uint32_t count,int64_t *eta) {
+    if (!playgo_ok(handle)) return PLAYGO_BAD_HANDLE;
+    if (!ids || !eta) return PLAYGO_BAD_POINTER;
+    if (!count) return PLAYGO_BAD_SIZE;
+    *eta=0;
+    return 0;
+}
+static ABI int32_t playgo_get_progress(int32_t handle,const uint16_t *ids,uint32_t count,GuestPlayGoProgress *out) {
+    if (!playgo_ok(handle)) return PLAYGO_BAD_HANDLE;
+    if (!ids || !out) return PLAYGO_BAD_POINTER;
+    if (!count) return PLAYGO_BAD_SIZE;
+    for (uint32_t i=0;i<count;++i) if (ids[i]>=playgo_chunks) return PLAYGO_BAD_CHUNK;
+    out->progress_size=out->total_size=count; /* complete: progress equals total */
+    return 0;
+}
+static ABI int32_t playgo_get_todo(int32_t handle,void *list,uint32_t count,uint32_t *out) {
+    (void)list; (void)count;
+    if (!playgo_ok(handle)) return PLAYGO_BAD_HANDLE;
+    if (!out) return PLAYGO_BAD_POINTER;
+    *out=0; /* nothing left to install */
+    return 0;
+}
+static ABI int32_t playgo_set_todo(int32_t handle,const void *list,uint32_t count) {
+    (void)list; (void)count;
+    return playgo_ok(handle) ? 0 : PLAYGO_BAD_HANDLE;
+}
+static ABI int32_t playgo_prefetch(int32_t handle,const uint16_t *ids,uint32_t count,int32_t min_locus) {
+    (void)min_locus;
+    if (!playgo_ok(handle)) return PLAYGO_BAD_HANDLE;
+    if (!ids) return PLAYGO_BAD_POINTER;
+    if (!count) return PLAYGO_BAD_SIZE;
+    return 0;
+}
+static ABI int32_t playgo_close(int32_t handle) {
+    if (!playgo_ok(handle)) return PLAYGO_BAD_HANDLE;
+    playgo_handle=0;
+    return 0;
+}
+static ABI int32_t playgo_terminate(void) { playgo_handle=0; return 0; }
 
 /* ---- DiscMap: the game is fully installed, no disc bitmap exists ---- */
 #define DISC_MAP_NO_BITMAP ((int32_t)0x81100004)
@@ -462,6 +511,10 @@ static const RuntimeExport exports[]={
     {"sceNpTrophyGetGameInfo",trophy_game_info}, {"sceNpTrophyGetTrophyInfo",trophy_info},
     {"scePlayGoInitialize",playgo_init}, {"scePlayGoOpen",playgo_open}, {"scePlayGoGetChunkId",playgo_chunk_ids},
     {"scePlayGoGetLocus",playgo_locus}, {"scePlayGoSetInstallSpeed",playgo_speed},
+    {"scePlayGoGetInstallSpeed",playgo_get_speed}, {"scePlayGoGetEta",playgo_get_eta},          /* bbport-ctr */
+    {"scePlayGoGetProgress",playgo_get_progress}, {"scePlayGoGetToDoList",playgo_get_todo},     /* bbport-ctr */
+    {"scePlayGoSetToDoList",playgo_set_todo}, {"scePlayGoPrefetch",playgo_prefetch},            /* bbport-ctr */
+    {"scePlayGoClose",playgo_close}, {"scePlayGoTerminate",playgo_terminate},                   /* bbport-ctr */
     {"sceMouseInit",ok_void}, {"sceMouseOpen",mouse_open}, {"sceMouseRead",mouse_read}, {"sceMouseClose",mouse_close},
     {"sceAudioInOpen",audio_in_open},
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
