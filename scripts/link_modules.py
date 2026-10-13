@@ -213,6 +213,38 @@ def link(game, out, module_names=DEFAULT_MODULES):
                      or main_tls['vaddr'] + main_tls['filesz'] > size):
         raise ValueError('unsupported eboot TLS layout')
     procparam = next(p for p in main['ph'] if p['type'] == 0x61000001)
+
+    # --- bbport-ctr: ejaan Bloodborne untuk runtime ---
+    # Pencocokan modul di atas memakai identitas (NID, library, modul), jadi nama di
+    # boot.bin tetap ejaan asli game. Runtime C (runtime_resolve) mencocokkan ejaan
+    # CUSA03173 ("NID#p#J" dst.), jadi baru di sini, sesudah binding selesai, nama
+    # diterjemahkan lewat NAMA library. Untuk Bloodborne sendiri hasilnya tidak berubah.
+    BB_SUFFIX = {
+        'libScePad': 'A#B', 'libSceGnmDriver': 'B#C', 'libSceVideoOut': 'C#D',
+        'libSceUserService': 'D#E', 'libSceNet': 'E#F', 'libSceAudioOut': 'G#H',
+        'libSceRtc': 'H#I', 'libScePosix': 'I#J', 'libSceNetCtl': 'J#K',
+        'libSceHttp': 'K#L', 'libSceSsl': 'L#M', 'libSceSysmodule': 'M#N',
+        'libSceAjm': 'N#O', 'libSceSaveData': 'O#P', 'libkernel': 'p#J',
+        'libSceNpMatching2': 'P#Q', 'libc': 'q#q', 'libSceNpManager': 'R#S',
+        'libSceNpUtility': 'S#T', 'libSceNpSignaling': 'T#U', 'libSceMouse': 'U#V',
+        'libSceSystemService': 'V#W', 'libSceNpWebApi': 'W#X', 'libSceNpAuth': 'X#Y',
+        'libSceAudioIn': 'Y#Z', 'libSceCommonDialog': 'Z#a', 'libSceImeDialog': 'b#c',
+        'libSceAppContent': 'c#d', 'libSceSaveDataDialog': 'd#e',
+        'libSceNpProfileDialog': 'h#i', 'libSceVoice': 'i#j', 'libSceMsgDialog': 'j#k',
+        'libSceNpCommerce': 'k#l', 'libSceNpTrophy': 'l#m', 'libSceAvPlayer': 'm#n',
+        'libScePlayGo': 'n#o', 'libSceNpScore': 'o#p',
+    }
+
+    def ejaan_bb(name):
+        ident = main['identity'](name)          # (NID, (library, versi), (modul, versi))
+        if not ident:
+            return name                         # sudah "NID#library" atau nama biasa
+        n, (lib, _versi), _modul = ident
+        return f'{n}#{BB_SUFFIX[lib]}' if lib in BB_SUFFIX else f'{n}#{lib}'
+
+    runtime_names = [ejaan_bb(name) for name in names]
+    # --- akhir bbport-ctr ---
+
     with (out / 'boot-linked.bin').open('wb') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
@@ -226,7 +258,7 @@ def link(game, out, module_names=DEFAULT_MODULES):
             f.write(struct.pack('<3Q', *binding))
         for segment in segments:
             f.write(struct.pack('<3Q', *segment))
-        for name in names:
+        for name in runtime_names:              # bbport-ctr: ejaan Bloodborne
             if len(name.encode()) >= 128:
                 raise ValueError('name too long')
             f.write(name.encode().ljust(128, b'\0'))
@@ -236,7 +268,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
     report = dict(modules=[{k: (hex(v) if k in ('base', 'init', 'tls_address') else v) for k, v in t.items()} for t in table],
                   bindings=len(bindings), imports=len(names), fs_loads_patched=fs_patched,
                   main_tls=dict(zip(('vaddr', 'filesz', 'memsz', 'align'), main_tls_values)),
-                  unresolved_imports=unresolved)
+                  unresolved_imports=unresolved,
+                  runtime_imports=runtime_names)       # bbport-ctr: nama yang dibaca probe.c
     (out / 'link.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     summary = ', '.join(f"{t['file']}@{t['base']:#x}" for t in table)
     print(f'Linked modules: {summary}; {len(bindings)} native bindings, {len(unresolved)} imports left to the host runtime, '
