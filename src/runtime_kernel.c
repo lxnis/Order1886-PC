@@ -384,6 +384,115 @@ static ABI int32_t pthread_cancel_guest(void *thread) {
     return 0;
 }
 
+/* ---- bbport-ctr: event flags ----
+ * 64 shared bits. A waiter asks for a pattern: AND (all bits) or OR (any bit); on
+ * success it may clear all bits or just the pattern. Reference: shadPS4
+ * kernel/threads/event_flag.cpp. Error numbers use the guest (FreeBSD) values. */
+#define EVF_AND 0x01
+#define EVF_OR 0x02
+#define EVF_CLEAR_ALL 0x10
+#define EVF_CLEAR_PAT 0x20
+typedef struct {
+    pthread_mutex_t lock; pthread_cond_t changed;
+    uint64_t bits; uint32_t attr; int waiters, deleted; char name[32];
+} GuestEventFlag;
+static _Atomic uint64_t event_flags_created, event_flag_waits;
+static int evf_satisfied(const GuestEventFlag *e,uint64_t pattern,uint32_t mode) {
+    return (mode&EVF_AND) ? (e->bits&pattern)==pattern : (e->bits&pattern)!=0;
+}
+static void evf_consume(GuestEventFlag *e,uint64_t pattern,uint32_t mode,uint64_t *result) {
+    if (result) *result=e->bits;
+    if (mode&EVF_CLEAR_ALL) e->bits=0;
+    else if (mode&EVF_CLEAR_PAT) e->bits&=~pattern;
+}
+static int evf_mode_valid(uint64_t pattern,uint32_t mode) {
+    int how=mode&(EVF_AND|EVF_OR), clear=mode&(EVF_CLEAR_ALL|EVF_CLEAR_PAT);
+    return pattern && (how==EVF_AND || how==EVF_OR) && clear!=(EVF_CLEAR_ALL|EVF_CLEAR_PAT) &&
+           !(mode&~(uint32_t)(EVF_AND|EVF_OR|EVF_CLEAR_ALL|EVF_CLEAR_PAT));
+}
+static ABI int32_t evf_create(GuestEventFlag **out,const char *name,uint32_t attr,uint64_t init,const void *opt) {
+    (void)opt;
+    if (!out || !name) return ERR(22);
+    GuestEventFlag *e=calloc(1,sizeof(*e));
+    if (!e) return ERR(12);
+    pthread_mutex_init(&e->lock,NULL); pthread_cond_init(&e->changed,NULL);
+    e->bits=init; e->attr=attr;
+    snprintf(e->name,sizeof(e->name),"%s",name);
+    *out=e;
+    atomic_fetch_add(&event_flags_created,1);
+    printf("Runtime: event flag \"%s\" created, attr=0x%x, initial=0x%llx\n",e->name,attr,(unsigned long long)init);
+    return 0;
+}
+static ABI int32_t evf_delete(GuestEventFlag *e) {
+    if (!e) return ERR(3);
+    pthread_mutex_lock(&e->lock);
+    e->deleted=1; pthread_cond_broadcast(&e->changed);
+    int busy=e->waiters;
+    pthread_mutex_unlock(&e->lock);
+    if (!busy) { pthread_cond_destroy(&e->changed); pthread_mutex_destroy(&e->lock); free(e); }
+    return 0; /* a flag deleted under waiters is left allocated: they wake with ECANCELED */
+}
+static ABI int32_t evf_set(GuestEventFlag *e,uint64_t pattern) {
+    if (!e) return ERR(3);
+    pthread_mutex_lock(&e->lock);
+    e->bits|=pattern; pthread_cond_broadcast(&e->changed);
+    pthread_mutex_unlock(&e->lock);
+    return 0;
+}
+static ABI int32_t evf_clear(GuestEventFlag *e,uint64_t pattern) {
+    if (!e) return ERR(3);
+    pthread_mutex_lock(&e->lock);
+    e->bits&=pattern; /* PS4 semantics: the pattern is ANDed in */
+    pthread_mutex_unlock(&e->lock);
+    return 0;
+}
+static ABI int32_t evf_poll(GuestEventFlag *e,uint64_t pattern,uint32_t mode,uint64_t *result) {
+    if (!e) return ERR(3);
+    if (!evf_mode_valid(pattern,mode)) return ERR(22);
+    pthread_mutex_lock(&e->lock);
+    int ok=evf_satisfied(e,pattern,mode);
+    if (ok) evf_consume(e,pattern,mode,result);
+    else if (result) *result=e->bits;
+    pthread_mutex_unlock(&e->lock);
+    return ok ? 0 : ERR(16); /* EBUSY */
+}
+static ABI int32_t evf_wait(GuestEventFlag *e,uint64_t pattern,uint32_t mode,uint64_t *result,uint32_t *timeout_us) {
+    if (!e) return ERR(3);
+    if (!evf_mode_valid(pattern,mode)) return ERR(22);
+    struct timespec start,deadline;
+    clock_gettime(CLOCK_MONOTONIC,&start);
+    if (timeout_us) {
+        uint64_t ns=(uint64_t)start.tv_nsec+(uint64_t)*timeout_us*1000;
+        deadline.tv_sec=start.tv_sec+(time_t)(ns/1000000000); deadline.tv_nsec=(long)(ns%1000000000);
+    }
+    atomic_fetch_add(&event_flag_waits,1);
+    pthread_mutex_lock(&e->lock);
+    ++e->waiters;
+    int32_t r=0;
+    while (!e->deleted && !evf_satisfied(e,pattern,mode)) {
+        if (!timeout_us) { pthread_cond_wait(&e->changed,&e->lock); continue; }
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+        if (now.tv_sec>deadline.tv_sec || (now.tv_sec==deadline.tv_sec && now.tv_nsec>=deadline.tv_nsec)) {
+            r=ERR(60); break; /* ETIMEDOUT */
+        }
+        /* condition variables time out on CLOCK_REALTIME: wait in short slices */
+        struct timespec slice; clock_gettime(CLOCK_REALTIME,&slice);
+        slice.tv_nsec+=1000000; if (slice.tv_nsec>=1000000000) { slice.tv_sec++; slice.tv_nsec-=1000000000; }
+        pthread_cond_timedwait(&e->changed,&e->lock,&slice);
+    }
+    if (!r && e->deleted) r=ERR(85); /* ECANCELED */
+    if (!r) evf_consume(e,pattern,mode,result);
+    else if (result) *result=e->bits;
+    --e->waiters;
+    pthread_mutex_unlock(&e->lock);
+    if (timeout_us) {
+        struct timespec end; clock_gettime(CLOCK_MONOTONIC,&end);
+        uint64_t used=(uint64_t)(end.tv_sec-start.tv_sec)*1000000+(uint64_t)((end.tv_nsec-start.tv_nsec)/1000);
+        *timeout_us = used>=*timeout_us ? 0 : *timeout_us-(uint32_t)used;
+    }
+    return r;
+}
+
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
@@ -418,6 +527,9 @@ static const RuntimeExport exports[]={
     {"scePthreadCondattrInit",condattr_init}, {"scePthreadCondattrDestroy",condattr_destroy},  /* bbport-ctr */
     {"scePthreadGetthreadid",pthread_get_threadid}, {"scePthreadGetname",pthread_get_name},    /* bbport-ctr */
     {"scePthreadCancel",pthread_cancel_guest},                                                  /* bbport-ctr */
+    {"sceKernelCreateEventFlag",evf_create}, {"sceKernelDeleteEventFlag",evf_delete},         /* bbport-ctr */
+    {"sceKernelSetEventFlag",evf_set}, {"sceKernelClearEventFlag",evf_clear},                 /* bbport-ctr */
+    {"sceKernelWaitEventFlag",evf_wait}, {"sceKernelPollEventFlag",evf_poll},                 /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
