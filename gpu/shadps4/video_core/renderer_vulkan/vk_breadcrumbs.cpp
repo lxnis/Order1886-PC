@@ -60,7 +60,8 @@ void Init(const Instance& instance) {
     if (env && env[0] == '0') {
         return;
     }
-    if (!instance.IsBufferMarkerSupported()) {
+    if (!instance.IsBufferMarkerSupported() ||
+        !VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdWriteBufferMarkerAMD) { // bbport-ctr: NVIDIA
         std::printf("GPU breadcrumbs: VK_AMD_buffer_marker unavailable, GPU hangs will not be "
                     "located\n");
         return;
