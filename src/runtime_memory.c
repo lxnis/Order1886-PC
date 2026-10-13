@@ -615,6 +615,28 @@ static ABI int32_t direct_memory_type(uint64_t phys, int *type, void **start, vo
     read_unlock();
     return ACCESS;
 }
+/* bbport-ctr: sceKernelDirectMemoryQuery. flags 0: the block containing offset;
+ * flags 1: that block, or else the nearest used block above offset. */
+typedef struct { uint64_t start, end; int32_t memory_type, reserved; } DirectQueryInfo;
+_Static_assert(sizeof(DirectQueryInfo)==24,"PS4 direct memory query info layout");
+static ABI int32_t direct_query(uint64_t offset, int flags, DirectQueryInfo *info, uint64_t info_size) {
+    if (!info || info_size<sizeof(*info)) return INVALID;
+    read_lock();
+    int best=-1;
+    for (int i=0;i<LIMIT;++i) {
+        if (!blocks[i].used) continue;
+        if (offset>=blocks[i].start && offset-blocks[i].start<blocks[i].size) { best=i; break; }
+        if (flags==1 && blocks[i].start>offset && (best<0 || blocks[i].start<blocks[best].start)) best=i;
+    }
+    if (best>=0) {
+        info->start=blocks[best].start;
+        info->end=blocks[best].start+blocks[best].size;
+        info->memory_type=blocks[best].type;
+        info->reserved=0;
+    }
+    read_unlock();
+    return best>=0 ? 0 : ACCESS;
+}
 static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, int flags) {
     if (!entries || count<0) return INVALID;
     int32_t result=0; int done=0;
@@ -647,6 +669,7 @@ static const RuntimeExport exports[]={
     {"sceKernelReleaseFlexibleMemory",release_flexible}, {"sceKernelReserveVirtualRange",reserve_range},
     {"sceKernelMprotect",kernel_mprotect}, {"sceKernelQueryMemoryProtection",query_protection},
     {"sceKernelVirtualQuery",virtual_query}, {"sceKernelGetDirectMemoryType",direct_memory_type},
+    {"sceKernelDirectMemoryQuery",direct_query},  /* bbport-ctr */
     {"sceKernelBatchMap",batch_map}, {"sceKernelBatchMap2",batch_map2},
     {"mmap",posix_mmap},
 };
