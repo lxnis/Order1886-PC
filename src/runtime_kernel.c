@@ -355,6 +355,34 @@ static ABI int32_t kernel_get_cpumode(void) {
     if (!reported) { reported=1; printf("Runtime: sceKernelGetCpumode -> 0 (6 CPU)\n"); }
     return 0;
 }
+/* scePthreadCondattr*: cond_init (runtime_mutex.c) ignores the attribute, so the
+ * attribute is a small allocated block, like the mutex attributes. */
+typedef struct { int32_t clock, pshared; } GuestCondattr;
+static ABI int32_t condattr_init(GuestCondattr **out) {
+    if (!out) return ERR(22);
+    GuestCondattr *a=calloc(1,sizeof(*a));
+    if (!a) return ERR(12);
+    *out=a; return 0;
+}
+static ABI int32_t condattr_destroy(GuestCondattr **attr) {
+    if (!attr || !*attr) return ERR(22);
+    free(*attr); *attr=NULL; return 0;
+}
+static ABI int32_t pthread_get_threadid(void) { return (int32_t)syscall(SYS_gettid); }
+/* First stage: the name of the calling host thread (games use it for logs). */
+static ABI int32_t pthread_get_name(void *thread,char *name) {
+    (void)thread;
+    if (!name) return ERR(22);
+    char host[16]={0};
+    pthread_getname_np(pthread_self(),host,sizeof(host));
+    memcpy(name,host,sizeof(host));
+    return 0;
+}
+/* First stage: cancellation is recorded, not performed. */
+static ABI int32_t pthread_cancel_guest(void *thread) {
+    printf("Runtime: scePthreadCancel(%p) recorded, not performed\n",thread);
+    return 0;
+}
 
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
@@ -387,6 +415,9 @@ static const RuntimeExport exports[]={
     {"sceKernelIsNeoMode",kernel_is_neo_mode},                            /* bbport-ctr */
     {"sceKernelIsAddressSanitizerEnabled",kernel_is_asan_enabled},        /* bbport-ctr */
     {"sceKernelGetCpumode",kernel_get_cpumode},                           /* bbport-ctr */
+    {"scePthreadCondattrInit",condattr_init}, {"scePthreadCondattrDestroy",condattr_destroy},  /* bbport-ctr */
+    {"scePthreadGetthreadid",pthread_get_threadid}, {"scePthreadGetname",pthread_get_name},    /* bbport-ctr */
+    {"scePthreadCancel",pthread_cancel_guest},                                                  /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
