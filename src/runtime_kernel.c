@@ -520,6 +520,15 @@ static ABI int32_t kernel_utc_to_local(int64_t utc,int64_t *local,GuestTimesec *
     return 0;
 }
 
+/* ---- bbport-ctr: libSceSharePlay (offline: never connected) ---- */
+static ABI int32_t shareplay_ok(void) { return 0; }
+static ABI int32_t shareplay_connection_info(int32_t *info) {
+    if (!info) return ERR(22);
+    info[0]=0; /* status: dormant */
+    info[1]=0; /* mode */
+    return 0;
+}
+
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
@@ -563,6 +572,10 @@ static const RuntimeExport exports[]={
     {"_ZN3sce4Json11Initializer9terminateEv",json_terminate},
     {"_ZN3sce4Json12MemAllocatorC2Ev",json_noop_this}, {"_ZN3sce4Json12MemAllocatorD2Ev",json_noop_this},
     {"_ZN3sce4Json12MemAllocator11notifyErrorEimPv",json_notify_error},
+    /* bbport-ctr: libSceSharePlay */
+    {"sceSharePlayInitialize",shareplay_ok}, {"sceSharePlayTerminate",shareplay_ok},
+    {"sceSharePlaySetProhibition",shareplay_ok},
+    {"sceSharePlayGetCurrentConnectionInfoA",shareplay_connection_info},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
