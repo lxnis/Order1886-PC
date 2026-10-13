@@ -493,6 +493,20 @@ static ABI int32_t evf_wait(GuestEventFlag *e,uint64_t pattern,uint32_t mode,uin
     return r;
 }
 
+/* ---- bbport-ctr: libSceJson2 stubs (offline; JSON is only used for online data) ----
+ * C++ member functions: the first argument is `this`. */
+static ABI void json_noop_this(void *self) { (void)self; }
+static ABI int32_t json_initialize(void *self,const void *param) {
+    (void)self; (void)param;
+    printf("Runtime: sce::Json initialized (offline stub)\n");
+    return 0;
+}
+static ABI int32_t json_terminate(void *self) { (void)self; return 0; }
+static ABI void json_notify_error(void *self,int32_t error,uint64_t size,void *user) {
+    (void)self; (void)user;
+    printf("Runtime: sce::Json allocator error %d (size %llu)\n",error,(unsigned long long)size);
+}
+
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
@@ -530,6 +544,12 @@ static const RuntimeExport exports[]={
     {"sceKernelCreateEventFlag",evf_create}, {"sceKernelDeleteEventFlag",evf_delete},         /* bbport-ctr */
     {"sceKernelSetEventFlag",evf_set}, {"sceKernelClearEventFlag",evf_clear},                 /* bbport-ctr */
     {"sceKernelWaitEventFlag",evf_wait}, {"sceKernelPollEventFlag",evf_poll},                 /* bbport-ctr */
+    /* bbport-ctr: libSceJson2 */
+    {"_ZN3sce4Json11InitializerC1Ev",json_noop_this}, {"_ZN3sce4Json11InitializerD1Ev",json_noop_this},
+    {"_ZN3sce4Json11Initializer10initializeEPKNS0_13InitParameterE",json_initialize},
+    {"_ZN3sce4Json11Initializer9terminateEv",json_terminate},
+    {"_ZN3sce4Json12MemAllocatorC2Ev",json_noop_this}, {"_ZN3sce4Json12MemAllocatorD2Ev",json_noop_this},
+    {"_ZN3sce4Json12MemAllocator11notifyErrorEimPv",json_notify_error},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
