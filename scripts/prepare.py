@@ -212,7 +212,52 @@ def prepare(game, out):
                     relocs.append((target, kind, imports[sym], addend))
             else:
                 raise ValueError(f'unsupported relocation {kind}')
-    names = [symbols[i]['name'] for i in imports]
+    # --- bbport-ctr: terjemahkan akhiran simbol game lain ke kode library Bloodborne ---
+    # Akhiran "#X#Y" adalah id library/modul yang ditentukan per game. Runtime bbport
+    # mencocokkan akhiran milik Bloodborne (CUSA03173), jadi akhiran game lain diterjemahkan
+    # lewat NAMA library. Untuk Bloodborne sendiri hasilnya tidak berubah.
+    BB_SUFFIX = {
+        'libScePad': 'A#B', 'libSceGnmDriver': 'B#C', 'libSceVideoOut': 'C#D',
+        'libSceUserService': 'D#E', 'libSceNet': 'E#F', 'libSceAudioOut': 'G#H',
+        'libSceRtc': 'H#I', 'libScePosix': 'I#J', 'libSceNetCtl': 'J#K',
+        'libSceHttp': 'K#L', 'libSceSsl': 'L#M', 'libSceSysmodule': 'M#N',
+        'libSceAjm': 'N#O', 'libSceSaveData': 'O#P', 'libkernel': 'p#J',
+        'libSceNpMatching2': 'P#Q', 'libc': 'q#q', 'libSceNpManager': 'R#S',
+        'libSceNpUtility': 'S#T', 'libSceNpSignaling': 'T#U', 'libSceMouse': 'U#V',
+        'libSceSystemService': 'V#W', 'libSceNpWebApi': 'W#X', 'libSceNpAuth': 'X#Y',
+        'libSceAudioIn': 'Y#Z', 'libSceCommonDialog': 'Z#a', 'libSceImeDialog': 'b#c',
+        'libSceAppContent': 'c#d', 'libSceSaveDataDialog': 'd#e',
+        'libSceNpProfileDialog': 'h#i', 'libSceVoice': 'i#j', 'libSceMsgDialog': 'j#k',
+        'libSceNpCommerce': 'k#l', 'libSceNpTrophy': 'l#m', 'libSceAvPlayer': 'm#n',
+        'libScePlayGo': 'n#o', 'libSceNpScore': 'o#p',
+    }
+    ABJAD = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-'
+
+    def angka(kode):
+        n = 0
+        for c in kode:
+            n = n * 64 + ABJAD.index(c)
+        return n
+
+    lib_names = {}
+    for tag, value in dyn:                      # semua entri, bukan dict tags
+        if tag == 0x61000015:                   # DT_SCE_IMPORT_LIB
+            lib_names[value >> 48] = string(value & 0xffffffff)
+
+    def terjemahkan(simbol):
+        bagian = simbol.split('#')
+        if len(bagian) != 3:
+            return simbol
+        nid_, kode_lib, _kode_modul = bagian
+        lib = lib_names.get(angka(kode_lib))
+        if lib in BB_SUFFIX:
+            return f'{nid_}#{BB_SUFFIX[lib]}'   # library yang juga dipakai Bloodborne
+        if lib:
+            return f'{nid_}#{lib}'              # library baru, misalnya libSceFont
+        return simbol
+
+    names = [terjemahkan(symbols[i]['name']) for i in imports]
+    # --- akhir bbport-ctr ---
     candidates = ('_init_env', 'atexit', 'exit', '_exit', '__cxa_atexit', '__cxa_finalize',
                   '__cxa_guard_acquire', '__cxa_guard_release', '__cxa_guard_abort',
                   '__stack_chk_guard', '__stack_chk_fail', 'malloc', 'free',
