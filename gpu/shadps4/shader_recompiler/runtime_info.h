@@ -168,11 +168,20 @@ struct HwGeometryRuntimeInfo {
     std::span<const u32> vs_copy;
     u64 vs_copy_hash;
 
+    // sacredfire: every field the recompiler reads takes part. The ESGS item size
+    // (in_vertex_data_size) decides which input vertex a ring slot belongs to
+    // (ring_access_elimination.cpp): two specializations that differed only in it compared equal,
+    // and the permutation lookup handed CTR's fur geometry shader a module compiled for the other
+    // size (fur rendered wrong, in a session and across the on-disk cache). The upstream code also
+    // tested `num_invocations && other.num_invocations` instead of comparing them.
     bool operator==(const HwGeometryRuntimeInfo& other) const {
-        return num_outputs == other.num_outputs && outputs == other.outputs && num_invocations &&
-               other.num_invocations && output_vertices == other.output_vertices &&
+        return num_outputs == other.num_outputs && outputs == other.outputs &&
+               num_invocations == other.num_invocations &&
+               output_vertices == other.output_vertices &&
+               in_vertex_data_size == other.in_vertex_data_size &&
+               out_vertex_data_size == other.out_vertex_data_size &&
                in_primitive == other.in_primitive &&
-               std::ranges::equal(out_primitive, other.out_primitive) &&
+               std::ranges::equal(out_primitive, other.out_primitive) && mode == other.mode &&
                vs_copy_hash == other.vs_copy_hash;
     }
 };
@@ -249,8 +258,10 @@ struct HwComputeRuntimeInfo {
     std::array<u32, 3> workgroup_size;
     std::array<bool, 3> tgid_enable;
 
+    // sacredfire: the LDS size steers the shared-memory passes, so it is part of the identity.
     bool operator==(const HwComputeRuntimeInfo& other) const noexcept {
-        return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable;
+        return shared_memory_size == other.shared_memory_size &&
+               workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable;
     }
 };
 

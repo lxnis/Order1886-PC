@@ -109,12 +109,30 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                     break;
                 }
 
-                const auto vertex_id = (info.index_enable ? IR::GetBufferIndexArg(&inst)
-                                                          : IR::GetBufferVOffsetArg(&inst))
-                                           .U32() >>
-                                       2;
+                auto vertex_id = (info.index_enable ? IR::GetBufferIndexArg(&inst)
+                                                    : IR::GetBufferVOffsetArg(&inst))
+                                     .U32() >>
+                                 2;
                 const auto soffset = IR::GetBufferSOffsetArg(&inst);
-                const auto bucket = soffset.U32() / 256u;
+                auto bucket = soffset.U32() / 256u;
+                // sacredfire: the ESGS ring stores input vertices consecutively, one component per
+                // 256-byte slot and in_vertex_data_size components per vertex. CTR's fur geometry
+                // shader addresses the second input vertex through the slot offset instead of the
+                // vertex offset register; a slot past the first vertex belongs to the next one.
+                // Without this the shader declared 15 input locations (over the 64-component
+                // limit of this GPU) that its export stage never writes.
+                const u32 in_vertex_dwords = gs_info.in_vertex_data_size;
+                if (bucket >= 32u) {
+                    LOG_WARNING(Render_Vulkan,
+                                "sacredfire GS ring read: slot {} vertex {} (esgs itemsize {} dwords, "
+                                "gsvs itemsize {}, copy comps {}, in_primitive {})",
+                                bucket, vertex_id, in_vertex_dwords, gs_info.out_vertex_data_size,
+                                program.info.gs_copy_data.num_comps, u32(gs_info.in_primitive));
+                }
+                if (in_vertex_dwords != 0 && bucket >= in_vertex_dwords) {
+                    vertex_id += bucket / in_vertex_dwords;
+                    bucket %= in_vertex_dwords;
+                }
                 const auto attrib = bucket < 4 ? IR::Attribute::Position0
                                                : IR::Attribute::Param0 + (bucket / 4 - 1);
                 const auto comp = bucket % 4;
