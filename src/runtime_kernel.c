@@ -341,6 +341,13 @@ static ABI int32_t kernel_is_neo_mode(void) {
     if (!reported) { reported=1; printf("Runtime: sceKernelIsNeoMode -> 0 (base PS4)\n"); }
     return 0;
 }
+/* sceKernelIsAddressSanitizerEnabled: libc CTR bertanya apakah game dibuild dengan
+ * AddressSanitizer (alat debug pemeriksa memori). Build retail: tidak (0). */
+static ABI int32_t kernel_is_asan_enabled(void) {
+    static int reported;
+    if (!reported) { reported=1; printf("Runtime: sceKernelIsAddressSanitizerEnabled -> 0\n"); }
+    return 0;
+}
 
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
@@ -371,6 +378,7 @@ static const RuntimeExport exports[]={
     {"_sceKernelSetThreadAtexitReport",kernel_set_thread_atexit_report},  /* bbport-ctr */
     {"sceLibcHeapGetTraceInfo",libc_heap_get_trace_info},                 /* bbport-ctr */
     {"sceKernelIsNeoMode",kernel_is_neo_mode},                            /* bbport-ctr */
+    {"sceKernelIsAddressSanitizerEnabled",kernel_is_asan_enabled},        /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else

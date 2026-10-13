@@ -752,3 +752,5 @@
 {"pB-yGZ2nQ9o#p#J","_sceKernelSetThreadAtexitCount"},
 {"WhCc1w3EhSI#p#J","_sceKernelSetThreadAtexitReport"},
 {"NWtTN10cJzE#libSceLibcInternalExt","sceLibcHeapGetTraceInfo"},
+{"WslcK1FQcGI#p#J","sceKernelIsNeoMode"},
+{"jh+8XiK4LeE#p#J","sceKernelIsAddressSanitizerEnabled"},
