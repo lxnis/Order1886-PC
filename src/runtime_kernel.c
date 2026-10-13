@@ -287,6 +287,18 @@ static ABI int32_t posix_key_create(uint32_t *k,KeyDestructor d) { int32_t r=key
 static ABI int32_t posix_key_delete(uint32_t k) { int32_t r=key_delete(k); return r ? r&0xffff : 0; }
 static ABI int32_t posix_key_set(uint32_t k,void *v) { int32_t r=key_set(k,v); return r ? r&0xffff : 0; }
 
+/* ---- bbport-ctr: thread destructors ----
+ * libc.prx milik CTR (SDK lebih baru dari Bloodborne) mendaftarkan satu fungsi yang
+ * harus dipanggil saat thread game selesai (rujukan: shadPS4 kernel/threads/pthread.cpp,
+ * _sceKernelSetThreadDtors). Tahap pertama: alamatnya disimpan; pemanggilannya saat
+ * thread keluar ditambahkan setelah game benar-benar membuat thread. */
+typedef void (ABI *ThreadDtor)(void);
+static ThreadDtor thread_dtors;
+static ABI void kernel_set_thread_dtors(ThreadDtor dtor) {
+    thread_dtors=dtor;
+    printf("Runtime: thread destructor registered at %p\n",(void *)thread_dtors);
+}
+
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
@@ -311,6 +323,7 @@ static const RuntimeExport exports[]={
     {"scePthreadSetspecific",key_set}, {"scePthreadGetspecific",key_get},
     {"pthread_key_create",posix_key_create}, {"pthread_key_delete",posix_key_delete},
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
+    {"_sceKernelSetThreadDtors",kernel_set_thread_dtors},  /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
