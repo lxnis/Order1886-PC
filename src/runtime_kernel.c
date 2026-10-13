@@ -348,6 +348,13 @@ static ABI int32_t kernel_is_asan_enabled(void) {
     if (!reported) { reported=1; printf("Runtime: sceKernelIsAddressSanitizerEnabled -> 0\n"); }
     return 0;
 }
+/* sceKernelGetCpumode: berapa core CPU yang boleh dipakai game. 0 = mode 6 core
+ * (CPUMODE_6CPU), jawaban yang sama dengan shadPS4, tempat CTR berjalan lancar. */
+static ABI int32_t kernel_get_cpumode(void) {
+    static int reported;
+    if (!reported) { reported=1; printf("Runtime: sceKernelGetCpumode -> 0 (6 CPU)\n"); }
+    return 0;
+}
 
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
@@ -379,6 +386,7 @@ static const RuntimeExport exports[]={
     {"sceLibcHeapGetTraceInfo",libc_heap_get_trace_info},                 /* bbport-ctr */
     {"sceKernelIsNeoMode",kernel_is_neo_mode},                            /* bbport-ctr */
     {"sceKernelIsAddressSanitizerEnabled",kernel_is_asan_enabled},        /* bbport-ctr */
+    {"sceKernelGetCpumode",kernel_get_cpumode},                           /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else

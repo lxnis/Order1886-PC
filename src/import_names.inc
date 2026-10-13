@@ -755,3 +755,4 @@
 {"WslcK1FQcGI#p#J","sceKernelIsNeoMode"},
 {"jh+8XiK4LeE#p#J","sceKernelIsAddressSanitizerEnabled"},
 {"BHouLQzh0X0#p#J","sceKernelDirectMemoryQuery"},
+{"VOx8NGmHXTs#p#J","sceKernelGetCpumode"},
