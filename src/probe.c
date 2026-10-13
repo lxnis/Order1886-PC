@@ -165,6 +165,18 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    /* bbport-ctr: a call through a NULL function pointer leaves its return address on top of
+     * the stack: report the caller (library + offset) for addr2line. */
+    if (rip == 0) {
+        const uintptr_t ret = *(const uintptr_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        Dl_info caller;
+        if (dladdr((void *)ret, &caller) && caller.dli_fname)
+            snprintf(line, sizeof(line), "  NULL call from %s+0x%lx (%s)\n", caller.dli_fname,
+                     (unsigned long)(ret - (uintptr_t)caller.dli_fbase), caller.dli_sname ? caller.dli_sname : "?");
+        else
+            snprintf(line, sizeof(line), "  NULL call, return address %p\n", (void *)ret);
+        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
     /* Outside the image and any shared object (generated code, a freed mapping): the mapping
      * from /proc/self/maps, and the thread. */
