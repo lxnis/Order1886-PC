@@ -576,6 +576,9 @@ static const RuntimeExport exports[]={
     {"sceSharePlayInitialize",shareplay_ok}, {"sceSharePlayTerminate",shareplay_ok},
     {"sceSharePlaySetProhibition",shareplay_ok},
     {"sceSharePlayGetCurrentConnectionInfoA",shareplay_connection_info},
+    /* bbport-ctr: libSceGameLiveStreaming (offline) */
+    {"sceGameLiveStreamingInitialize",shareplay_ok}, {"sceGameLiveStreamingTerminate",shareplay_ok},
+    {"sceGameLiveStreamingEnableLiveStreaming",shareplay_ok},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
