@@ -751,3 +751,4 @@
 {"rNhWz+lvOMU#p#J","_sceKernelSetThreadDtors"},
 {"pB-yGZ2nQ9o#p#J","_sceKernelSetThreadAtexitCount"},
 {"WhCc1w3EhSI#p#J","_sceKernelSetThreadAtexitReport"},
+{"NWtTN10cJzE#libSceLibcInternalExt","sceLibcHeapGetTraceInfo"},

@@ -31,18 +31,18 @@ typedef struct { int64_t sec, usec; } GuestTimeval;
 
 int32_t runtime_guest_errno(int e) {
     switch (e) {
-    case 0: return 0;
-    case EPERM: return 1; case ENOENT: return 2; case ESRCH: return 3; case EINTR: return 4;
-    case EIO: return 5; case ENXIO: return 6; case E2BIG: return 7; case ENOEXEC: return 8;
-    case EBADF: return 9; case ECHILD: return 10; case EDEADLK: return 11; case ENOMEM: return 12;
-    case EACCES: return 13; case EFAULT: return 14; case EBUSY: return 16; case EEXIST: return 17;
-    case EXDEV: return 18; case ENODEV: return 19; case ENOTDIR: return 20; case EISDIR: return 21;
-    case EINVAL: return 22; case ENFILE: return 23; case EMFILE: return 24; case ENOTTY: return 25;
-    case EFBIG: return 27; case ENOSPC: return 28; case ESPIPE: return 29; case EROFS: return 30;
-    case EMLINK: return 31; case EPIPE: return 32; case ERANGE: return 34; case EAGAIN: return 35;
-    case ENAMETOOLONG: return 63; case ENOTEMPTY: return 66; case ETIMEDOUT: return 60;
-    case ELOOP: return 62; case ENOSYS: return 78; case EOVERFLOW: return 84; case ECANCELED: return 85;
-    default: return 5; /* EIO: unmapped host error */
+        case 0: return 0;
+        case EPERM: return 1; case ENOENT: return 2; case ESRCH: return 3; case EINTR: return 4;
+        case EIO: return 5; case ENXIO: return 6; case E2BIG: return 7; case ENOEXEC: return 8;
+        case EBADF: return 9; case ECHILD: return 10; case EDEADLK: return 11; case ENOMEM: return 12;
+        case EACCES: return 13; case EFAULT: return 14; case EBUSY: return 16; case EEXIST: return 17;
+        case EXDEV: return 18; case ENODEV: return 19; case ENOTDIR: return 20; case EISDIR: return 21;
+        case EINVAL: return 22; case ENFILE: return 23; case EMFILE: return 24; case ENOTTY: return 25;
+        case EFBIG: return 27; case ENOSPC: return 28; case ESPIPE: return 29; case EROFS: return 30;
+        case EMLINK: return 31; case EPIPE: return 32; case ERANGE: return 34; case EAGAIN: return 35;
+        case ENAMETOOLONG: return 63; case ENOTEMPTY: return 66; case ETIMEDOUT: return 60;
+        case ELOOP: return 62; case ENOSYS: return 78; case EOVERFLOW: return 84; case ECANCELED: return 85;
+        default: return 5; /* EIO: unmapped host error */
     }
 }
 static int32_t fail_posix(int e) { *runtime_errno()=runtime_guest_errno(e); return -1; }
@@ -52,13 +52,13 @@ static struct timespec process_start;
 __attribute__((constructor)) static void remember_start(void) { clock_gettime(CLOCK_MONOTONIC,&process_start); }
 static int host_clock(uint32_t id,clockid_t *out) {
     switch (id) {
-    case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
-    case 4: case 11: case 12: case 5: case 7: case 8: *out=CLOCK_MONOTONIC; return 1; /* MONOTONIC/UPTIME */
-    case 13: *out=CLOCK_REALTIME_COARSE; return 1;                    /* SECOND */
-    case 14: *out=CLOCK_THREAD_CPUTIME_ID; return 1;
-    case 2: case 15: *out=CLOCK_PROCESS_CPUTIME_ID; return 1;         /* PROF/PROCTIME */
-    case 16: case 17: case 18: case 19: *out=CLOCK_MONOTONIC; return 1; /* PS4 network clocks */
-    default: return 0;
+        case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
+        case 4: case 11: case 12: case 5: case 7: case 8: *out=CLOCK_MONOTONIC; return 1; /* MONOTONIC/UPTIME */
+        case 13: *out=CLOCK_REALTIME_COARSE; return 1;                    /* SECOND */
+        case 14: *out=CLOCK_THREAD_CPUTIME_ID; return 1;
+        case 2: case 15: *out=CLOCK_PROCESS_CPUTIME_ID; return 1;         /* PROF/PROCTIME */
+        case 16: case 17: case 18: case 19: *out=CLOCK_MONOTONIC; return 1; /* PS4 network clocks */
+        default: return 0;
     }
 }
 static int clock_read(uint32_t id,GuestTimespec *ts) {
@@ -180,18 +180,18 @@ static _Thread_local GuestSigset signal_mask;
 static uintptr_t handlers[128];
 static ABI uintptr_t guest_signal(int sig,uintptr_t handler) {
     if (sig<=0 || sig>=128) { *runtime_errno()=22; return (uintptr_t)-1; } /* SIG_ERR */
-    uintptr_t old=handlers[sig]; handlers[sig]=handler;
-    printf("Runtime: guest signal(%d) handler recorded (host signals are not forwarded)\n",sig);
-    return old;
+        uintptr_t old=handlers[sig]; handlers[sig]=handler;
+        printf("Runtime: guest signal(%d) handler recorded (host signals are not forwarded)\n",sig);
+        return old;
 }
 static ABI int32_t guest_sigprocmask(int how,const GuestSigset *set,GuestSigset *old) {
     if (old) *old=signal_mask;
     if (!set) return 0;
     for (int i=0;i<4;++i) {
         if (how==1) signal_mask.bits[i]|=set->bits[i];        /* SIG_BLOCK */
-        else if (how==2) signal_mask.bits[i]&=~set->bits[i];  /* SIG_UNBLOCK */
-        else if (how==3) signal_mask.bits[i]=set->bits[i];    /* SIG_SETMASK */
-        else return fail_posix(EINVAL);
+            else if (how==2) signal_mask.bits[i]&=~set->bits[i];  /* SIG_UNBLOCK */
+                else if (how==3) signal_mask.bits[i]=set->bits[i];    /* SIG_SETMASK */
+                    else return fail_posix(EINVAL);
     }
     return 0;
 }
@@ -310,6 +310,37 @@ static ABI void kernel_set_thread_atexit_report(void *fn) {
     thread_atexit_report=fn;
     printf("Runtime: thread atexit report callback at %p\n",thread_atexit_report);
 }
+/* sceLibcHeapGetTraceInfo (libSceLibcInternalExt): malloc milik libc.prx CTR meminta lokasi
+ * tabel pelacakan heap. libc mengisi kolom size; runtime mengisi sisanya
+ * (rujukan: shadPS4 libc_internal/libc_internal_memory.cpp). */
+typedef struct {
+    uint64_t size;                      /* 0x00: diisi libc */
+    uint32_t flag;                      /* 0x08 */
+    uint32_t get_segment_info;          /* 0x0c */
+    uint64_t *mspace_atomic_id_mask;    /* 0x10 */
+    uint64_t *mstate_table;             /* 0x18 */
+} GuestHeapTraceInfo;
+_Static_assert(sizeof(GuestHeapTraceInfo)==32,"GuestHeapTraceInfo harus 32 byte");
+static uint64_t heap_mspace_atomic_id_mask, heap_mstate_table[64];
+static ABI void libc_heap_get_trace_info(GuestHeapTraceInfo *info) {
+    if (!info) return;
+    if (info->size<sizeof(*info)) {
+        fprintf(stderr,"STOP: heap trace info struct too small (%llu bytes)\n",(unsigned long long)info->size);
+        runtime_report();
+        exit(21);
+    }
+    info->get_segment_info=0;
+    info->mspace_atomic_id_mask=&heap_mspace_atomic_id_mask;
+    info->mstate_table=heap_mstate_table;
+    printf("Runtime: heap trace info provided (struct %llu bytes)\n",(unsigned long long)info->size);
+}
+/* sceKernelIsNeoMode: apakah game berjalan di PS4 Pro ("Neo"). CTR mendukung mode Pro, tapi
+ * mode itu mengubah cara game memakai GPU. Seperti bawaan shadPS4, jawab "PS4 biasa" (0). */
+static ABI int32_t kernel_is_neo_mode(void) {
+    static int reported;
+    if (!reported) { reported=1; printf("Runtime: sceKernelIsNeoMode -> 0 (base PS4)\n"); }
+    return 0;
+}
 
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
@@ -338,6 +369,8 @@ static const RuntimeExport exports[]={
     {"_sceKernelSetThreadDtors",kernel_set_thread_dtors},  /* bbport-ctr */
     {"_sceKernelSetThreadAtexitCount",kernel_set_thread_atexit_count},    /* bbport-ctr */
     {"_sceKernelSetThreadAtexitReport",kernel_set_thread_atexit_report},  /* bbport-ctr */
+    {"sceLibcHeapGetTraceInfo",libc_heap_get_trace_info},                 /* bbport-ctr */
+    {"sceKernelIsNeoMode",kernel_is_neo_mode},                            /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
