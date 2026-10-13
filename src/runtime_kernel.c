@@ -507,6 +507,19 @@ static ABI void json_notify_error(void *self,int32_t error,uint64_t size,void *u
     printf("Runtime: sce::Json allocator error %d (size %llu)\n",error,(unsigned long long)size);
 }
 
+/* bbport-ctr: sceKernelConvertUtcToLocaltime, used by CTR's libc.prx (localtime). */
+typedef struct { int64_t t; uint32_t west_sec, dst_sec; } GuestTimesec;
+_Static_assert(sizeof(GuestTimesec)==16,"PS4 timesec layout");
+static ABI int32_t kernel_utc_to_local(int64_t utc,int64_t *local,GuestTimesec *st,uint64_t *dst_sec) {
+    time_t t=(time_t)utc; struct tm tm;
+    if (!localtime_r(&t,&tm)) return ERR(22);
+    const int64_t dst=tm.tm_isdst>0 ? 3600 : 0;
+    if (local) *local=utc+tm.tm_gmtoff;
+    if (st) { st->t=utc; st->west_sec=(uint32_t)(tm.tm_gmtoff-dst); st->dst_sec=(uint32_t)dst; }
+    if (dst_sec) *dst_sec=(uint64_t)dst;
+    return 0;
+}
+
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
@@ -516,7 +529,7 @@ static const RuntimeExport exports[]={
     {"sceKernelUsleep",kernel_usleep}, {"usleep",posix_usleep}, {"sleep",posix_sleep},
     {"nanosleep",posix_nanosleep}, {"sceKernelNanosleep",kernel_nanosleep},
     {"sceKernelGettimezone",kernel_gettimezone}, {"gettimeofday",posix_gettimeofday},
-    {"sceKernelGettimeofday",kernel_gettimeofday},
+    {"sceKernelGettimeofday",kernel_gettimeofday}, {"sceKernelConvertUtcToLocaltime",kernel_utc_to_local},  /* bbport-ctr */
     {"time",posix_time},
     {"getpagesize",get_pagesize}, {"getpid",get_pid}, {"sched_yield",yield},
     {"_exit",hard_exit},
