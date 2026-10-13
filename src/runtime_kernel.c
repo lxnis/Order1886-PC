@@ -383,6 +383,19 @@ static ABI int32_t pthread_cancel_guest(void *thread) {
     printf("Runtime: scePthreadCancel(%p) recorded, not performed\n",thread);
     return 0;
 }
+/* pthread_setschedparam/getschedparam (POSIX): priorities are accepted, not applied. */
+typedef struct { int32_t sched_priority; } GuestSchedParam;
+static ABI int32_t posix_setschedparam(void *thread,int32_t policy,const GuestSchedParam *param) {
+    (void)thread; (void)policy;
+    return param ? 0 : 22; /* POSIX returns the error number itself */
+}
+static ABI int32_t posix_getschedparam(void *thread,int32_t *policy,GuestSchedParam *param) {
+    (void)thread;
+    if (!policy || !param) return 22;
+    *policy=2;                  /* FreeBSD SCHED_OTHER */
+    param->sched_priority=700;  /* PS4 default priority */
+    return 0;
+}
 
 /* ---- bbport-ctr: event flags ----
  * 64 shared bits. A waiter asks for a pattern: AND (all bits) or OR (any bit); on
@@ -563,6 +576,7 @@ static const RuntimeExport exports[]={
     {"scePthreadCondattrInit",condattr_init}, {"scePthreadCondattrDestroy",condattr_destroy},  /* bbport-ctr */
     {"scePthreadGetthreadid",pthread_get_threadid}, {"scePthreadGetname",pthread_get_name},    /* bbport-ctr */
     {"scePthreadCancel",pthread_cancel_guest},                                                  /* bbport-ctr */
+    {"pthread_setschedparam",posix_setschedparam}, {"pthread_getschedparam",posix_getschedparam},  /* bbport-ctr */
     {"sceKernelCreateEventFlag",evf_create}, {"sceKernelDeleteEventFlag",evf_delete},         /* bbport-ctr */
     {"sceKernelSetEventFlag",evf_set}, {"sceKernelClearEventFlag",evf_clear},                 /* bbport-ctr */
     {"sceKernelWaitEventFlag",evf_wait}, {"sceKernelPollEventFlag",evf_poll},                 /* bbport-ctr */
