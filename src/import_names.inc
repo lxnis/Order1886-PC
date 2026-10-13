@@ -749,3 +749,5 @@
 {"lbQKqsERhtE#libSceDiscMap","sceDiscMapIsRequestOnHDD"},
 {"ioKMruft1ek#libSceDiscMap","sceDiscMap_8A828CAEE7EDD5E9"},
 {"rNhWz+lvOMU#p#J","_sceKernelSetThreadDtors"},
+{"pB-yGZ2nQ9o#p#J","_sceKernelSetThreadAtexitCount"},
+{"WhCc1w3EhSI#p#J","_sceKernelSetThreadAtexitReport"},

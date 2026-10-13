@@ -298,6 +298,18 @@ static ABI void kernel_set_thread_dtors(ThreadDtor dtor) {
     thread_dtors=dtor;
     printf("Runtime: thread destructor registered at %p\n",(void *)thread_dtors);
 }
+/* Dua pendaftaran sejenis dari libc.prx CTR, dipanggil tepat sesudahnya: fungsi untuk
+ * menghitung dan melaporkan handler atexit per thread. shadPS4 tidak mengimplementasikan
+ * keduanya dan CTR tetap berjalan, jadi tahap pertama cukup menyimpan alamatnya. */
+static void *thread_atexit_count, *thread_atexit_report;
+static ABI void kernel_set_thread_atexit_count(void *fn) {
+    thread_atexit_count=fn;
+    printf("Runtime: thread atexit count callback at %p\n",thread_atexit_count);
+}
+static ABI void kernel_set_thread_atexit_report(void *fn) {
+    thread_atexit_report=fn;
+    printf("Runtime: thread atexit report callback at %p\n",thread_atexit_report);
+}
 
 static const RuntimeExport exports[]={
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
@@ -324,6 +336,8 @@ static const RuntimeExport exports[]={
     {"pthread_key_create",posix_key_create}, {"pthread_key_delete",posix_key_delete},
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
     {"_sceKernelSetThreadDtors",kernel_set_thread_dtors},  /* bbport-ctr */
+    {"_sceKernelSetThreadAtexitCount",kernel_set_thread_atexit_count},    /* bbport-ctr */
+    {"_sceKernelSetThreadAtexitReport",kernel_set_thread_atexit_report},  /* bbport-ctr */
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 #else
@@ -387,18 +401,22 @@ void runtime_wait_report(double frames) {
     static FILE *dump; static int dump_checked;
     if (!dump_checked) { const char *path=getenv("BB_WAIT_LOG"); if (path && *path) dump=fopen(path,"w"); dump_checked=1; }
     if (dump) {
-        for (int i=0;i<n;++i)
+        for (int i=0;i<n;++i) {
             fprintf(dump,"%s %d %s %#lx %#lx %#lx %.2f %.3f\n", rows[i].w->name, rows[i].w->tid, kinds[rows[i].w->kind&3],
                     (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
                     rows[i].count/frames, rows[i].ns/(frames*1e6));
+        }
         fprintf(dump,"--\n"); fflush(dump);
     }
     for (int i=1;i<n;++i) for (int j=i;j>0 && rows[j].ns>rows[j-1].ns;--j) { __typeof__(rows[0]) t=rows[j]; rows[j]=rows[j-1]; rows[j-1]=t; }
     printf("Guest waits per frame (thread kind +site):");
-    for (int i=0;i<n && i<12;++i) if (rows[i].ns/rows[i].count<5000000)
-        printf("%s %s %s +%#lx<+%#lx<+%#lx %.1fx %.2f ms", i ? ";" : "", rows[i].w->name, kinds[rows[i].w->kind&3],
-               (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
-               rows[i].count/frames, rows[i].ns/(frames*1e6));
+    for (int i=0;i<n && i<12;++i) {
+        if (rows[i].ns/rows[i].count<5000000) {
+            printf("%s %s %s +%#lx<+%#lx<+%#lx %.1fx %.2f ms", i ? ";" : "", rows[i].w->name, kinds[rows[i].w->kind&3],
+                   (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
+                   rows[i].count/frames, rows[i].ns/(frames*1e6));
+        }
+    }
     printf("\n");
 }
 
