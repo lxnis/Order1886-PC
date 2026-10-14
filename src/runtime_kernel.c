@@ -355,6 +355,174 @@ static ABI int32_t kernel_get_cpumode(void) {
     if (!reported) { reported=1; printf("Runtime: sceKernelGetCpumode -> 0 (6 CPU)\n"); }
     return 0;
 }
+/* bbport-dmc: sceKernelSetVirtualRangeName(addr, len, name) memberi nama pada sebuah rentang
+ * memori, hanya untuk alat debug Sony (Razor dan sejenisnya). Tidak mengubah memori sama sekali,
+ * jadi cukup dicatat dan dijawab berhasil (0). DmC (Unreal Engine 3) memanggilnya saat
+ * inisialisasi libc. */
+static ABI int32_t kernel_set_virtual_range_name(const void *addr, size_t len, const char *name) {
+    static int reported;
+    if (reported < 8) {
+        reported++;
+        printf("Runtime: sceKernelSetVirtualRangeName(%p, 0x%zx, \"%s\") -> 0\n",
+               addr, len, name ? name : "(null)");
+    }
+    return 0;
+}
+/* bbport-dmc: sceKernelLoadStartModule(path, args, argp, flags, opt, result).
+ * Modul game sudah di-link ke image oleh link_modules.py, jadi tidak ada yang perlu dimuat.
+ * Handle modul di PS4 bilangan positif; *result adalah nilai balik module_start (0 = berhasil). */
+static ABI int32_t kernel_load_start_module(const char *path, size_t args, const void *argp,
+                                            uint32_t flags, const void *opt, int32_t *result) {
+    static int32_t next_handle = 0x100;
+    (void)args; (void)argp; (void)opt;
+    const int32_t handle = next_handle++;
+    printf("Runtime: sceKernelLoadStartModule(\"%s\", flags=0x%x) -> handle 0x%x (sudah di-link)\n",
+           path ? path : "(null)", flags, handle);
+    if (result) *result = 0;
+    return handle;
+}
+/* bbport-dmc: POSIX semaphores. The guest's sem_t holds a pointer to a host semaphore. */
+#include <semaphore.h>
+static sem_t *guest_sem(void *sem) { return sem ? *(sem_t **)sem : NULL; }
+static ABI int32_t posix_sem_init(void *sem, int32_t pshared, uint32_t value) {
+    (void)pshared;
+    if (!sem) return fail_posix(EINVAL);
+    sem_t *host = malloc(sizeof(sem_t));
+    if (!host) return fail_posix(ENOMEM);
+    if (sem_init(host, 0, value)) { const int e = errno; free(host); return fail_posix(e); }
+    *(sem_t **)sem = host;
+    return 0;
+}
+static ABI int32_t posix_sem_destroy(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    sem_destroy(host);
+    free(host);
+    *(sem_t **)sem = NULL;
+    return 0;
+}
+static ABI int32_t posix_sem_wait(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    while (sem_wait(host)) if (errno != EINTR) return fail_posix(errno);
+    return 0;
+}
+static ABI int32_t posix_sem_trywait(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    return sem_trywait(host) ? fail_posix(errno) : 0;
+}
+/* The deadline is absolute CLOCK_REALTIME; FreeBSD's x86-64 timespec matches Linux's. */
+static ABI int32_t posix_sem_timedwait(void *sem, const struct timespec *deadline) {
+    sem_t *host = guest_sem(sem);
+    if (!host || !deadline) return fail_posix(EINVAL);
+    while (sem_timedwait(host, deadline)) if (errno != EINTR) return fail_posix(errno);
+    return 0;
+}
+static ABI int32_t posix_sem_post(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    return sem_post(host) ? fail_posix(errno) : 0;
+}
+static ABI int32_t posix_sem_getvalue(void *sem, int32_t *value) {
+    sem_t *host = guest_sem(sem);
+    if (!host || !value) return fail_posix(EINVAL);
+    int v = 0;
+    if (sem_getvalue(host, &v)) return fail_posix(errno);
+    *value = v;
+    return 0;
+}
+
+/* ---- bbport-dmc: stub batch 1 ---- */
+#define DMC_NP_SIGNED_OUT ((int32_t)0x80550006)
+#define DMC_LOG(name) do { static int n_; if (n_ < 4) { n_++; printf("Runtime: dmc-stub %s\n", name); } } while (0)
+
+/* NP: offline console, signed out. */
+static ABI int32_t dmc_np_signed_out(void) { DMC_LOG("NP call -> SIGNED_OUT"); return DMC_NP_SIGNED_OUT; }
+static ABI int32_t dmc_np_ok(void) { DMC_LOG("NP cleanup -> 0"); return 0; }
+static ABI int32_t dmc_np_get_account_id(int32_t user, uint64_t *account) {
+    DMC_LOG("sceNpGetAccountId -> SIGNED_OUT");
+    (void)user;
+    if (account) *account = 0;
+    return DMC_NP_SIGNED_OUT;
+}
+static ABI int32_t dmc_np_new_id(void) {   /* contexts/requests/handles: a positive id */
+    static atomic_int next = 1;
+    DMC_LOG("NP create -> id");
+    return atomic_fetch_add(&next, 1);
+}
+
+/* libSceNgs2: fake handles, silent rendering. */
+typedef struct { void *buffer; size_t size; uint32_t waveform_type; uint32_t channels; } DmcNgs2RenderBuffer;
+static ABI int32_t dmc_ngs2_system_create(const void *option, const void *allocator, uint64_t *handle) {
+    (void)option; (void)allocator;
+    DMC_LOG("sceNgs2SystemCreateWithAllocator (tanpa suara)");
+    if (handle) *handle = 0x4e475332; /* "NGS2" */
+    return 0;
+}
+static ABI int32_t dmc_ngs2_rack_create(uint64_t system, uint32_t rack_id, const void *option,
+                                        const void *allocator, uint64_t *handle) {
+    (void)system; (void)option; (void)allocator;
+    static uint64_t next = 0x52000000; /* "R" */
+    DMC_LOG("sceNgs2RackCreateWithAllocator");
+    if (handle) *handle = next++ + ((uint64_t)rack_id << 8);
+    return 0;
+}
+static ABI int32_t dmc_ngs2_rack_voice(uint64_t rack, uint32_t index, uint64_t *handle) {
+    if (handle) *handle = (rack << 16) | (index + 1);
+    return 0;
+}
+static ABI int32_t dmc_ngs2_voice_flags(uint64_t voice, uint32_t *flags) {
+    (void)voice;
+    if (flags) *flags = 0; /* not playing */
+    return 0;
+}
+static ABI int32_t dmc_ngs2_render(uint64_t system, DmcNgs2RenderBuffer *buffers, uint32_t count) {
+    (void)system;
+    for (uint32_t i = 0; buffers && i < count; i++)
+        if (buffers[i].buffer && buffers[i].size) memset(buffers[i].buffer, 0, buffers[i].size);
+    return 0;
+}
+static ABI int32_t dmc_ngs2_ok(void) { return 0; }
+static ABI int32_t dmc_ngs2_parse_waveform(const void *data, size_t size, void *info) {
+    (void)data; (void)size; (void)info;
+    DMC_LOG("sceNgs2ParseWaveformData -> error (no decoder yet)");
+    return (int32_t)0x804A0000; /* libSceNgs2 error facility; exact code not verified */
+}
+
+/* Common dialogs nobody needs offline: open, finish immediately, "user cancelled". */
+static ABI int32_t dmc_dialog_ok(void) { DMC_LOG("dialog -> 0"); return 0; }
+static ABI int32_t dmc_dialog_finished(void) { return 3; /* SCE_COMMON_DIALOG_STATUS_FINISHED */ }
+static ABI int32_t dmc_dialog_result(int32_t *result) {
+    if (result) *result = 1; /* SCE_COMMON_DIALOG_RESULT_USER_CANCELED */
+    return 0;
+}
+
+/* System service / app content. */
+typedef struct { float ratio; uint8_t reserved[128]; } DmcSafeArea;
+static ABI int32_t dmc_safe_area(DmcSafeArea *info) {
+    DMC_LOG("sceSystemServiceGetDisplaySafeAreaInfo -> 1.0");
+    if (!info) return (int32_t)0x80A10003;
+    memset(info, 0, sizeof(*info));
+    info->ratio = 1.0f;
+    return 0;
+}
+static ABI int32_t dmc_temp_mount2(uint32_t option, char *mount_point) {
+    (void)option;
+    DMC_LOG("sceAppContentTemporaryDataMount2 -> /temp0");
+    if (mount_point) strcpy(mount_point, "/temp0"); /* SceAppContentMountPoint: char[16] */
+    return 0;
+}
+static ABI int32_t dmc_ok(void) { DMC_LOG("setter/no-op -> 0"); return 0; }
+static ABI int32_t dmc_no_socket(void) { DMC_LOG("accept/recv -> EBADF"); return fail_posix(EBADF); }
+/* bbport-dmc: stub batch 2 */
+static ABI int32_t dmc_trophy_unlock_state(int32_t context, int32_t handle, uint32_t *flags, uint32_t *count) {
+    (void)context; (void)handle;
+    DMC_LOG("sceNpTrophyGetTrophyUnlockState -> none unlocked");
+    if (flags) memset(flags, 0, 4 * sizeof(uint32_t));
+    if (count) *count = 0;
+    return 0;
+}
 /* scePthreadCondattr*: cond_init (runtime_mutex.c) ignores the attribute, so the
  * attribute is a small allocated block, like the mutex attributes. */
 typedef struct { int32_t clock, pshared; } GuestCondattr;
@@ -395,6 +563,15 @@ static ABI int32_t posix_getschedparam(void *thread,int32_t *policy,GuestSchedPa
     *policy=2;                  /* FreeBSD SCHED_OTHER */
     param->sched_priority=700;  /* PS4 default priority */
     return 0;
+}
+/* bbport-dmc: scePthread* versions: same behaviour, SCE error codes (0x80020000 + errno). */
+static ABI int32_t sce_setschedparam(void *thread,int32_t policy,const GuestSchedParam *param) {
+    const int32_t e=posix_setschedparam(thread,policy,param);
+    return e ? (int32_t)(0x80020000u|(uint32_t)e) : 0;
+}
+static ABI int32_t sce_getschedparam(void *thread,int32_t *policy,GuestSchedParam *param) {
+    const int32_t e=posix_getschedparam(thread,policy,param);
+    return e ? (int32_t)(0x80020000u|(uint32_t)e) : 0;
 }
 
 /* ---- bbport-ctr: event flags ----
@@ -573,10 +750,51 @@ static const RuntimeExport exports[]={
     {"sceKernelIsNeoMode",kernel_is_neo_mode},                            /* bbport-ctr */
     {"sceKernelIsAddressSanitizerEnabled",kernel_is_asan_enabled},        /* bbport-ctr */
     {"sceKernelGetCpumode",kernel_get_cpumode},                           /* bbport-ctr */
+    {"sceKernelSetVirtualRangeName",kernel_set_virtual_range_name},     /* bbport-dmc */
+    {"sceKernelLoadStartModule",kernel_load_start_module},              /* bbport-dmc */
+    {"sem_init",posix_sem_init}, {"sem_destroy",posix_sem_destroy}, {"sem_wait",posix_sem_wait},   /* bbport-dmc */
+    {"sem_trywait",posix_sem_trywait}, {"sem_timedwait",posix_sem_timedwait},                    /* bbport-dmc */
+    {"sem_post",posix_sem_post}, {"sem_getvalue",posix_sem_getvalue},                            /* bbport-dmc */
+    /* bbport-dmc: stub batch 1 */
+    {"sceNpGetAccountId",dmc_np_get_account_id},
+    {"sceNpTusCreateNpTitleCtx",dmc_np_new_id}, {"sceNpTssCreateNpTitleCtx",dmc_np_new_id},
+    {"sceNpTusCreateRequest",dmc_np_new_id}, {"sceNpTusDeleteNpTitleCtx",dmc_np_ok},
+    {"sceNpTusDeleteRequest",dmc_np_ok}, {"sceNpTusAbortRequest",dmc_np_ok},
+    {"sceNpTusPollAsync",dmc_np_signed_out}, {"sceNpTusGetDataAsync",dmc_np_signed_out},
+    {"sceNpTusSetDataAsync",dmc_np_signed_out}, {"sceNpTssGetDataAsync",dmc_np_signed_out},
+    {"sceNpTusGetMultiSlotVariableAsync",dmc_np_signed_out},
+    {"sceNpTusSetMultiSlotVariableAsync",dmc_np_signed_out},
+    {"sceNpInGameMessageInitialize",dmc_np_new_id}, {"sceNpInGameMessageCreateHandle",dmc_np_new_id},
+    {"sceNpInGameMessagePrepare",dmc_np_signed_out}, {"sceNpInGameMessageSendData",dmc_np_signed_out},
+    {"sceNpInGameMessageDeleteHandle",dmc_np_ok}, {"sceNpInGameMessageTerminate",dmc_np_ok},
+    {"sceNpLookupCreateRequest",dmc_np_new_id}, {"sceNpLookupWaitAsync",dmc_np_signed_out},
+    {"sceNpBandwidthTestInitStart",dmc_np_signed_out}, {"sceNpBandwidthTestGetStatus",dmc_np_signed_out},
+    {"sceNpBandwidthTestAbort",dmc_np_ok}, {"sceNpBandwidthTestShutdown",dmc_np_signed_out},
+    {"sceNgs2SystemCreateWithAllocator",dmc_ngs2_system_create},
+    {"sceNgs2RackCreateWithAllocator",dmc_ngs2_rack_create},
+    {"sceNgs2RackGetVoiceHandle",dmc_ngs2_rack_voice}, {"sceNgs2VoiceGetStateFlags",dmc_ngs2_voice_flags},
+    {"sceNgs2SystemRender",dmc_ngs2_render}, {"sceNgs2VoiceControl",dmc_ngs2_ok},
+    {"sceNgs2RackDestroy",dmc_ngs2_ok}, {"sceNgs2SystemDestroy",dmc_ngs2_ok},
+    {"sceNgs2ParseWaveformData",dmc_ngs2_parse_waveform},
+    {"sceNpFriendListDialogInitialize",dmc_dialog_ok}, {"sceNpFriendListDialogOpen",dmc_dialog_ok},
+    {"sceNpFriendListDialogUpdateStatus",dmc_dialog_finished},
+    {"sceNpFriendListDialogGetResult",dmc_dialog_result}, {"sceNpFriendListDialogTerminate",dmc_dialog_ok},
+    {"sceGameCustomDataDialogInitialize",dmc_dialog_ok}, {"sceGameCustomDataDialogOpen",dmc_dialog_ok},
+    {"sceGameCustomDataDialogUpdateStatus",dmc_dialog_finished},
+    {"sceGameCustomDataDialogGetResult",dmc_dialog_result}, {"sceGameCustomDataDialogTerminate",dmc_dialog_ok},
+    {"sceSystemServiceGetDisplaySafeAreaInfo",dmc_safe_area},
+    {"sceSystemServiceShowDisplaySafeAreaSettings",dmc_ok},
+    {"sceAppContentTemporaryDataMount2",dmc_temp_mount2}, {"sceAppContentTemporaryDataFormat",dmc_ok},
+    {"sceVoiceSetMuteFlag",dmc_ok}, {"sceVoiceSetVolume",dmc_ok}, {"scePadSetLightBar",dmc_ok},
+    {"sceKernelUtimes",dmc_ok}, {"sceKernelMlock",dmc_ok}, {"msync",dmc_ok},
+    {"accept",dmc_no_socket}, {"recv",dmc_no_socket},
+    /* bbport-dmc: stub batch 2 */
+    {"sceNpTrophyGetTrophyUnlockState",dmc_trophy_unlock_state}, {"sceNpTrophyAbortHandle",dmc_ok},
     {"scePthreadCondattrInit",condattr_init}, {"scePthreadCondattrDestroy",condattr_destroy},  /* bbport-ctr */
     {"scePthreadGetthreadid",pthread_get_threadid}, {"scePthreadGetname",pthread_get_name},    /* bbport-ctr */
     {"scePthreadCancel",pthread_cancel_guest},                                                  /* bbport-ctr */
     {"pthread_setschedparam",posix_setschedparam}, {"pthread_getschedparam",posix_getschedparam},  /* bbport-ctr */
+    {"scePthreadSetschedparam",sce_setschedparam}, {"scePthreadGetschedparam",sce_getschedparam},  /* bbport-dmc */
     {"sceKernelCreateEventFlag",evf_create}, {"sceKernelDeleteEventFlag",evf_delete},         /* bbport-ctr */
     {"sceKernelSetEventFlag",evf_set}, {"sceKernelClearEventFlag",evf_clear},                 /* bbport-ctr */
     {"sceKernelWaitEventFlag",evf_wait}, {"sceKernelPollEventFlag",evf_poll},                 /* bbport-ctr */
