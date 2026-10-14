@@ -165,6 +165,38 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    /* bbport-dmc: register dump for guest faults; values inside the image also as guest offsets. */
+    if (rip - (uintptr_t)image < 0x10000000) {
+        static const struct { const char *name; int reg; } regs[] = {
+            {"rax",REG_RAX},{"rbx",REG_RBX},{"rcx",REG_RCX},{"rdx",REG_RDX},{"rsi",REG_RSI},
+            {"rdi",REG_RDI},{"rbp",REG_RBP},{"rsp",REG_RSP},{"r8",REG_R8},{"r9",REG_R9},
+            {"r10",REG_R10},{"r11",REG_R11},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15},
+        };
+        char thread[32] = "?";
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        snprintf(line, sizeof(line), "  thread %s\n", thread);
+        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+        for (size_t i = 0; i < sizeof(regs) / sizeof(*regs); i++) {
+            const uintptr_t v = (uintptr_t)uc->uc_mcontext.gregs[regs[i].reg];
+            if (v - (uintptr_t)image < 0x10000000)
+                snprintf(line, sizeof(line), "  %-3s = 0x%016lx  (guest offset 0x%lx)\n", regs[i].name,
+                         (unsigned long)v, (unsigned long)(v - (uintptr_t)image));
+            else
+                snprintf(line, sizeof(line), "  %-3s = 0x%016lx\n", regs[i].name, (unsigned long)v);
+            { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+        }
+        /* bbport-dmc: the top of the stack (return addresses of the callers). */
+        const uintptr_t *sp = (const uintptr_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        for (int i = 0; i < 24; i++) {
+            const uintptr_t v = sp[i];
+            if (v - (uintptr_t)image < 0x10000000)
+                snprintf(line, sizeof(line), "  [rsp+0x%02x] = 0x%016lx  (guest offset 0x%lx)\n", i * 8,
+                         (unsigned long)v, (unsigned long)(v - (uintptr_t)image));
+            else
+                snprintf(line, sizeof(line), "  [rsp+0x%02x] = 0x%016lx\n", i * 8, (unsigned long)v);
+            { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+        }
+    }
     /* bbport-ctr: a call through a NULL function pointer leaves its return address on top of
      * the stack: report the caller (library + offset) for addr2line. */
     if (rip == 0) {

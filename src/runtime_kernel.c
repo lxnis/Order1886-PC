@@ -536,7 +536,9 @@ static ABI int32_t condattr_destroy(GuestCondattr **attr) {
     if (!attr || !*attr) return ERR(22);
     free(*attr); *attr=NULL; return 0;
 }
-static ABI int32_t pthread_get_threadid(void) { return (int32_t)syscall(SYS_gettid); }
+/* bbport-dmc: the guest thread id (first field of the ScePthread handle), not gettid(). */
+int32_t runtime_thread_id(void);
+static ABI int32_t pthread_get_threadid(void) { return runtime_thread_id(); }
 /* First stage: the name of the calling host thread (games use it for logs). */
 static ABI int32_t pthread_get_name(void *thread,char *name) {
     (void)thread;

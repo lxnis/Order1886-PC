@@ -31,6 +31,10 @@ typedef struct ThreadAttr {
     struct ThreadAttr *next;
 } ThreadAttr;
 typedef struct GuestThread {
+    /* bbport-dmc: first field = thread id, as FreeBSD's struct pthread (long tid). Guest code
+     * reads it straight from the handle (UE3: ThreadID = *(int *)handle after scePthreadCreate),
+     * so it must equal scePthreadGetthreadid() and be set before the thread is created. */
+    int64_t tid;
     /* Guest-visible TCB is allocated separately; this is the ScePthread handle. */
     uint64_t *tcb;
     unsigned char *tls_block;
@@ -77,9 +81,11 @@ static void attach(GuestThread *t) {
     set_gs(tcb);
     current=t;
 }
+static int64_t next_tid=100000; /* bbport-dmc: FreeBSD thread ids start at 100000 */
 static GuestThread *new_thread(void) {
     GuestThread *t=calloc(1,sizeof(*t));
     if (!t) return NULL;
+    t->tid=__atomic_fetch_add(&next_tid,1,__ATOMIC_RELAXED);
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
 }
@@ -124,6 +130,8 @@ static ThreadAttr *find_attr(ThreadAttr **slot) {
 }
 
 static ABI void *thread_self(void) { return runtime_thread_current(); }
+/* bbport-dmc: the id scePthreadGetthreadid() reports; the same value heads the handle. */
+int32_t runtime_thread_id(void) { return (int32_t)runtime_thread_current()->tid; }
 static ABI int32_t *guest_error(void) { return &guest_errno; }
 int32_t *runtime_errno(void) { return &guest_errno; }
 
@@ -369,5 +377,6 @@ void runtime_thread_report(void) {
 uintptr_t runtime_thread_resolve(const char *name) { (void)name; return 0; }
 void runtime_thread_report(void) {}
 void runtime_thread_attach_main(void) {}
+int32_t runtime_thread_id(void) { return 0; }
 void runtime_set_main_tls(const void *d,uint64_t f,uint64_t m,uint64_t a) { (void)d;(void)f;(void)m;(void)a; }
 #endif

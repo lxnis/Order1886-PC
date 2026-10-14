@@ -1,3 +1,5 @@
+#include <cstring>
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -552,6 +554,24 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     } else {
         UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
                         u32(dma_data->dst_sel));
+    }
+}
+
+// bbport-dmc: the fixed-sequence occlusion counters, written in recording order. A query reset
+// (DMA fill of the results with zero) runs on the recording thread; written at decode time the
+// counters could land first and be wiped by the fill (DmC's loading waited forever).
+struct ZpassFixedEvent {
+    VAddr address;
+    u32 pairs;
+    u64 value;
+};
+void RunZpassFixed(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    ZpassFixedEvent event;
+    std::memcpy(&event, data, sizeof(event));
+    u64* results = reinterpret_cast<u64*>(event.address);
+    for (u32 i = 0; i < event.pairs; ++i, results += 2) {
+        *results = event.value;
+        rasterizer.NoteLateCommandWrite(reinterpret_cast<VAddr>(results), results, sizeof(*results));
     }
 }
 
@@ -1885,6 +1905,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
                     // registers: ApplyGraphicsRegisterPacket
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+                    { /* bbport-dmc: diagnosis, ZPASS_DONE events */
+                        static std::atomic<int> zpass_logged{0};
+                        if (zpass_logged.fetch_add(1) < 64)
+                            std::fprintf(stderr, "ZPASS: type=%u addr=0x%llx pairs=%d translated=%d\n",
+                                         unsigned(event->event_type.Value()),
+                                         (unsigned long long)event->Address<VAddr>(), int(num_counter_pairs),
+                                         int(rasterizer && Vulkan::Rasterizer::OcclusionTranslated()));
+                    }
                     if (event->event_type.Value() == EventType::PixelPipeStatDump ||
                         event->event_type.Value() == EventType::ZpassDone) {
                         // bbport: the samples that passed, counted by Vulkan occlusion queries
@@ -1897,12 +1925,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                            if (rasterizer) {
-                                rasterizer->NoteLateCommandWrite(reinterpret_cast<VAddr>(results),
-                                                                 results, sizeof(*results));
+                        if (rasterizer) {
+                            // bbport-dmc: in recording order, after an earlier reset fill.
+                            const ZpassFixedEvent fixed{event->Address<VAddr>(), u32(num_counter_pairs),
+                                                        pixel_counter | OcclusionCounterValidMask};
+                            rasterizer->RunInOrder(&RunZpassFixed, &fixed, sizeof(fixed),
+                                                   BbToggle::PipelinedMemoryWrites, false);
+                        } else {
+                            u64* results = event->Address<u64*>();
+                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                                *results = pixel_counter | OcclusionCounterValidMask;
                             }
                         }
                         pixel_counter += OcclusionCounterStep;
