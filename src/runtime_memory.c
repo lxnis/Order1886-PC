@@ -123,7 +123,9 @@ static GpuRange hook_map, hook_unmap, hook_invalidate;
 static GpuRange hook_note_write; /* bbport: data written into GPU memory (runtime_memory_note_write) */
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+/* bbport-order: 64 tidak cukup: saat hook GPU didaftarkan, setiap VMA yang sudah ada diantrekan
+ * (The Order memetakan ratusan blok 2 MB sebelum GPU siap). */
+static PendingHook pending[16384]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -249,14 +251,21 @@ static void queue_hook(int kind, uintptr_t address, uint64_t size) {
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
+    /* bbport-order: ambil seluruh antrean sekaligus (urutan tetap), bukan memmove per entri. */
     for (;;) {
         write_lock();
-        if (!pending_count) { write_unlock(); return; }
-        PendingHook h=pending[0];
-        memmove(pending,pending+1,--pending_count*sizeof(*pending));
-        GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
+        size_t n=pending_count;
+        if (!n) { write_unlock(); return; }
+        PendingHook *batch=malloc(n*sizeof(*batch));
+        if (!batch) { write_unlock(); fputs("STOP: GPU hook batch allocation failed\n",stderr); exit(21); }
+        memcpy(batch,pending,n*sizeof(*batch));
+        pending_count=0;
         write_unlock();
-        if (hook) hook(h.address,h.size);
+        for (size_t i=0;i<n;++i) {
+            GpuRange hook = batch[i].kind==HOOK_MAP ? hook_map : batch[i].kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
+            if (hook) hook(batch[i].address,batch[i].size);
+        }
+        free(batch);
     }
 }
 static int flex_test(uint64_t page) { return (int)((flex_bitmap[page/64]>>(page%64))&1); }

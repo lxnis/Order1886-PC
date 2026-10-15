@@ -3,7 +3,9 @@
 
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
+#include <optional>
 #include <queue>
+#include <vector>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #include "common/arch.h"
@@ -485,6 +487,43 @@ static bool EmitComputeOffsetBitFieldUExtract(Xbyak::CodeGenerator& c, Xbyak::Re
     return true;
 }
 
+// bbport-order: shader The Order (yang tidak diawali s_mov vcc_hi) membawa pointer/offset
+// descriptor melewati loop. SSA membuat Phi yang trivial: semua argumen di luar kelompok Phi itu
+// adalah nilai yang sama (Braun dkk., "redundant phi SCC"). Phi seperti itu diganti nilainya;
+// Phi yang benar-benar dinamis tetap gagal seperti sebelumnya.
+static std::optional<IR::Value> ResolveTrivialPhi(IR::Inst* phi) {
+    std::vector<IR::Inst*> stack{phi};
+    std::vector<IR::Inst*> seen{phi};
+    std::optional<IR::Value> found;
+    while (!stack.empty()) {
+        IR::Inst* p = stack.back();
+        stack.pop_back();
+        for (size_t i = 0; i < p->NumArgs(); ++i) {
+            const IR::Value arg = p->Arg(i);
+            if (arg.IsEmpty()) {
+                continue;
+            }
+            if (!arg.IsImmediate() && arg.Inst()->GetOpcode() == IR::Opcode::Phi) {
+                IR::Inst* q = arg.Inst();
+                if (std::ranges::find(seen, q) == seen.end()) {
+                    if (seen.size() >= 64) {
+                        return std::nullopt;
+                    }
+                    seen.push_back(q);
+                    stack.push_back(q);
+                }
+                continue;
+            }
+            if (!found) {
+                found = arg;
+            } else if (!(*found == arg)) {
+                return std::nullopt;
+            }
+        }
+    }
+    return found;
+}
+
 static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     switch (inst->GetOpcode()) {
     case IR::Opcode::GetUserData:
@@ -502,6 +541,7 @@ static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     case IR::Opcode::UMin32:
     case IR::Opcode::UMax32:
     case IR::Opcode::BitFieldUExtract:
+    case IR::Opcode::Phi: // bbport-order: diikuti agar ReadConstBuffer di baliknya ikut terkumpul
         return true;
     default:
         return false;
@@ -559,6 +599,16 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
     case IR::Opcode::BitFieldUExtract:
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
+    case IR::Opcode::Phi:
+        if (const auto value = ResolveTrivialPhi(inst)) { // bbport-order
+            if (value->IsImmediate()) {
+                c.mov(reg, value->U32());
+                return true;
+            }
+            return ComputeOffset(c, reg, pass_info, *value);
+        }
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, Phi (dinamis)");
+        return false;
     default:
         LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
                   magic_enum::enum_name(inst->GetOpcode()));
@@ -585,6 +635,27 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
     c.pop(rdi);
 }
 
+// bbport-order: offset dinamis (indeks loop / bindless) tidak bisa dihitung di CPU. Dulu bacaan
+// itu tidak mendapat slot sehingga shader dan CPU membaca user data dword 0 = descriptor sampah
+// (tile mode 29, swizzle 2/3, image 1,6 GB, data_fmt 28 ...). Sekarang setiap bacaan seperti itu
+// (dan seluruh sub-pohonnya) mendapat slot berisi 0: T# alamat 0 = texture kosong yang sah.
+static void ZeroFillSubtree(IR::Inst* subtree, PassInfo& pass_info, Xbyak::CodeGenerator& c) {
+    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
+    if (!use_list) {
+        return;
+    }
+    for (auto [src_off_dw, use] : *use_list) {
+        c.mov(dword[rsi + (pass_info.dst_off_dw << 2)], 0);
+        SetFlatbufOffset(use, pass_info.dst_off_dw);
+        pass_info.dst_off_dw++;
+    }
+    for (auto [src_off_dw, use] : *use_list) {
+        if (pass_info.GetUsesAsPointer(use)) {
+            ZeroFillSubtree(use, pass_info, c);
+        }
+    }
+}
+
 static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
                          Xbyak::CodeGenerator& c) {
     if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
@@ -595,6 +666,10 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 
     if (!PushPtr(c, pass_info, off_dw)) {
         LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+        // bbport-order: PushPtr sudah mendorong rdi sebelum gagal; tanpa pop, stack walker
+        // tidak seimbang dan `ret` di akhir melompat ke alamat sampah.
+        PopPtr(c);
+        ZeroFillSubtree(subtree, pass_info, c);
         return;
     }
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
@@ -611,11 +686,12 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
                 LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
-                continue;
+                c.xor_(r10d, r10d); // bbport-order: slot berisi 0, bukan dword 0 user data
+            } else {
+                c.shl(r10d, 2);
+                c.mov(r10d, r10d);
+                c.mov(r10d, dword[rdi + r10]);
             }
-            c.shl(r10d, 2);
-            c.mov(r10d, r10d);
-            c.mov(r10d, dword[rdi + r10]);
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
 

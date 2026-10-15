@@ -1065,6 +1065,42 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+// bbport-order: The Order terus meng-compile ulang shader yang sama (40-50 per 5 detik di layar
+// diam). Catat bagian spesialisasi yang berbeda dari permutasi sebelumnya (permutasi ke-3 ke atas).
+static void BbOrderLogPermutation(u64 hash, size_t perm_idx, const Shader::StageSpecialization& a,
+                                  const Shader::StageSpecialization& b) {
+    static std::atomic<u32> told{0};
+    if (perm_idx < 3 || told.fetch_add(1) >= 60) {
+        return;
+    }
+    std::string why;
+    if (a.vs_attribs != b.vs_attribs) why += " vs_attribs";
+    if (!(a.runtime_info == b.runtime_info)) why += " runtime_info";
+    if (a.fetch_shader_data != b.fetch_shader_data) why += " fetch";
+    if (a.fmasks != b.fmasks) why += " fmask";
+    if (a.start != b.start) why += " start";
+    for (size_t i = 0; i < a.buffers.size() && i < b.buffers.size(); ++i) {
+        if (!(a.buffers[i] == b.buffers[i])) {
+            why += fmt::format(" buf{}(stride {}->{} fmt {}->{} fmtd {})", i, b.buffers[i].stride,
+                               a.buffers[i].stride, u32(b.buffers[i].data_format),
+                               u32(a.buffers[i].data_format), u32(a.buffers[i].is_formatted));
+        }
+    }
+    for (size_t i = 0; i < a.images.size() && i < b.images.size(); ++i) {
+        if (!(a.images[i] == b.images[i])) {
+            why += fmt::format(" img{}(type {}->{} int {}->{} cube {}->{} binds {}->{})", i,
+                               u32(b.images[i].type), u32(a.images[i].type), b.images[i].is_integer,
+                               a.images[i].is_integer, b.images[i].is_cube, a.images[i].is_cube,
+                               b.images[i].num_bindings, a.images[i].num_bindings);
+        }
+    }
+    for (size_t i = 0; i < a.samplers.size() && i < b.samplers.size(); ++i) {
+        if (!(a.samplers[i] == b.samplers[i])) why += fmt::format(" smp{}", i);
+    }
+    LOG_WARNING(Render_Vulkan, "bbport-order: shader {:#x} permutasi ke-{}:{}", hash, perm_idx,
+                why.empty() ? " (beda di bitset/jumlah resource)" : why);
+}
+
 PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage hw_stage,
                                                 SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
@@ -1157,6 +1193,9 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         program->last_used = std::distance(program->modules.begin(), it);
     }
     if (it == program->modules.end()) {
+        if (!program->modules.empty()) { // bbport-order
+            BbOrderLogPermutation(params.hash, perm_idx, spec, program->modules.back().spec);
+        }
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 

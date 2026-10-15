@@ -194,7 +194,25 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
+DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
+/* bbport-order: SaveDataDialog dengan log isi parameternya (SDK: CommonDialog base 48 byte, lalu
+ * size, mode, dispType, pointer anim/items/userMsg/sysMsg/errorCode/progBar). mode: 1 user msg,
+ * 2 system msg, 3 kode error, 4 progress bar. */
+static ABI int32_t save_init(void) { return dialog_init(2); }
+static ABI int32_t save_open(const uint8_t *p) {
+    static int told;
+    if (p && told++ < 12) {
+        const uint32_t mode=*(const uint32_t *)(p+52), disp=*(const uint32_t *)(p+56);
+        const uint32_t *sys=*(const uint32_t *const *)(p+88);
+        const int32_t *err=*(const int32_t *const *)(p+96);
+        const uint32_t *user=*(const uint32_t *const *)(p+80);
+        printf("Runtime: bbport-order SaveDataDialog mode=%u dispType=%u sysMsgType=%d errorCode=%#x userMsgButtons=%d\n",
+               mode,disp,sys ? (int)sys[0] : -1,err ? (unsigned)err[0] : 0u,user ? (int)user[0] : -1);
+    }
+    return dialog_open(2);
+}
+static ABI int32_t save_status(void) { return dialog_status(2); }
+static ABI int32_t save_term(void) { return dialog_term(2); }
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,

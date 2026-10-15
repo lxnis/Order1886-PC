@@ -28,6 +28,7 @@
  * BB_PAD_CENTER_CAL=0 disables the measurement. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include <sys/mman.h> /* bbport-order */
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -260,6 +261,11 @@ static void report_guest_heap(void) {
     if (!enabled || now-last<5000000) return;
     last=now;
     const uint8_t *stub=(const uint8_t *)(0x800000000ull+0x56e0000+0x1f8c0);
+    /* bbport-order: alamat ini khusus libc Bloodborne. Di game lain (The Order: libc di +0x1770000)
+     * halaman itu tidak dipetakan -> crash. msync gagal (ENOMEM) untuk halaman yang tidak dipetakan. */
+    { static int mapped=-1;
+      if (mapped<0) mapped=msync((void *)((uintptr_t)stub & ~(uintptr_t)4095),4096,MS_ASYNC)==0;
+      if (!mapped) return; }
     if (stub[0]!=0xff || stub[1]!=0x25) return; /* another libc */
     ABI int (*stats)(MallocManagedSize *)=(ABI int (*)(MallocManagedSize *))(uintptr_t)stub;
     MallocManagedSize m={.size=sizeof(m),.version=1};

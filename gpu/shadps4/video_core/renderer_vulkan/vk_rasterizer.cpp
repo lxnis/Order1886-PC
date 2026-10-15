@@ -520,6 +520,24 @@ inline AmdGpu::CbDbExtent Rasterizer::DbExtent() const {
 }
 
 namespace {
+/// bbport-order: tile mode 27..30 tidak ada di GPU PS4; T# seperti itu berisi sampah
+/// (The Order: "Unknown tile mode = 29" di GetArrayMode). LinearGeneral (31) juga ditolak untuk
+/// texture: ImageInfo::UpdateSize tidak bisa mengukurnya ("Unhandled array mode"), dan di The Order
+/// yang memakainya hanya T# sampah (5_9_9_9 + UbnormNz).
+bool IsKnownTileMode(AmdGpu::TileMode mode) {
+    return static_cast<u32>(mode) <= static_cast<u32>(AmdGpu::TileMode::Thick3DXThick);
+}
+/// bbport-order: T# sampah bisa berukuran raksasa (lebar/tinggi 16384, ribuan layer) sehingga
+/// vmaCreateImage gagal dengan ErrorOutOfDeviceMemory. Texture asli PS4 jauh di bawah 1 GiB.
+bool IsPlausibleImageSize(const AmdGpu::Image& t) {
+    const u32 fmt = static_cast<u32>(t.GetDataFmt());
+    const u64 bits = fmt <= 56 ? AmdGpu::NumBitsPerElement(t.GetDataFmt()) : 32;
+    const u64 slices = t.GetType() == AmdGpu::ImageType::Color3D ? u64(t.depth) + 1 : t.NumLayers();
+    const u64 bytes = (u64(t.width) + 1) * (u64(t.height) + 1) * slices * (bits ? bits : 32) / 8;
+    // bbport-order: memori guest PS4 jauh di atas 256 MiB; T# di 0x1000 dsb. adalah sampah
+    // (The Order: image 530 MB di 0x1000 -> GetBarriers assertion).
+    return bytes <= (u64(1) << 30) && t.Address() >= (u64(1) << 28);
+}
 /// magic_enum::enum_contains, from a table: it scans every enumerator (per texture per draw).
 bool IsKnownFormat(AmdGpu::DataFormat data_fmt, AmdGpu::NumberFormat num_fmt) {
     static const auto tables = [] {
@@ -2210,7 +2228,8 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
             !memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !IsKnownFormat(data_fmt, num_fmt)) {
+            !IsKnownFormat(data_fmt, num_fmt) || !IsKnownTileMode(tsharp.GetTileMode()) ||
+            !IsPlausibleImageSize(tsharp)) {
             continue; // null descriptor
         }
         const auto& entry =
@@ -3276,7 +3295,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !IsKnownFormat(data_fmt, num_fmt)) {
+            !IsKnownFormat(data_fmt, num_fmt) || !IsKnownTileMode(tsharp.GetTileMode()) ||
+            !IsPlausibleImageSize(tsharp)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
                         "data_format={}, num_format={}",

@@ -191,11 +191,17 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
 }
 static ABI int32_t save_mount(const Mount1 *m, MountResult *result) {
     if (!m) return ERR_PARAMETER;
-    return mount(m->user,m->title ? m->title->data : NULL,m->dir,m->mode,result);
+    const int32_t r=mount(m->user,m->title ? m->title->data : NULL,m->dir,m->mode,result);
+    if (r) printf("Runtime: bbport-order sceSaveDataMount user=%d dir='%.32s' mode=%#x blocks=%llu -> %#x\n",
+                  m->user,m->dir ? m->dir->data : "",m->mode,(unsigned long long)m->blocks,(unsigned)r);
+    return r;
 }
 static ABI int32_t save_mount2(const Mount2 *m, MountResult *result) {
     if (!m) return ERR_PARAMETER;
-    return mount(m->user,NULL,m->dir,m->mode,result);
+    const int32_t r=mount(m->user,NULL,m->dir,m->mode,result);
+    if (r) printf("Runtime: bbport-order sceSaveDataMount2 user=%d dir='%.32s' mode=%#x -> %#x\n",
+                  m->user,m->dir ? m->dir->data : "",m->mode,(unsigned)r);
+    return r;
 }
 static int slot_of(const MountPoint *point) {
     if (!point || strncmp(point->data,"/savedata",9)) return -1;

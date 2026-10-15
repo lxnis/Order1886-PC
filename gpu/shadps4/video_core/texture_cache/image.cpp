@@ -132,6 +132,12 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result != VK_SUCCESS) { // bbport-order: detail image yang gagal, untuk diagnosis
+        LOG_ERROR(Render_Vulkan, "vmaCreateImage gagal: {}x{}x{}, {} mip, {} layer, {} sampel, format {}",
+                  image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+                  image_ci.mipLevels, image_ci.arrayLayers, u32(image_ci.samples),
+                  vk::to_string(image_ci.format));
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
@@ -278,7 +284,9 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
                 const auto subres_idx = mip * info.resources.layers + layer;
-                ASSERT(subres_idx < subresource_states.size());
+                if (subres_idx >= subresource_states.size()) { // bbport-order: view di luar image
+                    continue;
+                }
                 auto& state = subresource_states[subres_idx];
 
                 constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
