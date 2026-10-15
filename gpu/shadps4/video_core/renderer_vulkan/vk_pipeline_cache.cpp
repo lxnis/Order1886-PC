@@ -1079,7 +1079,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 static void BbOrderLogPermutation(u64 hash, size_t perm_idx, const Shader::StageSpecialization& a,
                                   const Shader::StageSpecialization& b) {
     static std::atomic<u32> told{0};
-    if (perm_idx < 3 || told.fetch_add(1) >= 60) {
+    if (perm_idx < 3 || told.fetch_add(1) >= 400) { // bbport-order: batas log 60 -> 400
         return;
     }
     std::string why;

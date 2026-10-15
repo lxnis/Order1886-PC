@@ -1,3 +1,4 @@
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -536,7 +537,14 @@ bool IsPlausibleImageSize(const AmdGpu::Image& t) {
     const u64 bytes = (u64(t.width) + 1) * (u64(t.height) + 1) * slices * (bits ? bits : 32) / 8;
     // bbport-order: memori guest PS4 jauh di atas 256 MiB; T# di 0x1000 dsb. adalah sampah
     // (The Order: image 530 MB di 0x1000 -> GetBarriers assertion).
-    return bytes <= (u64(1) << 30) && t.Address() >= (u64(1) << 28);
+    // bbport-order (21): 256 MiB = texture 8192x8192 RGBA8; 1 GiB meloloskan T# sampah 16384x16384
+    // yang dengan mip menjadi +-1,6 GB (freeze: "1 images registered, 1635 MB image uploads").
+    // bbport-order (25): perkiraan memakai pitch dan padding tile; T# sampah 60x25 pitch 10945,
+    // 3953 layer (1,2 GB di texture cache) membuat game freeze.
+    const u64 row = std::max<u64>(u64(t.width) + 1, t.Pitch());
+    const u64 padded = ((row + 63) & ~u64(63)) * ((u64(t.height) + 8) & ~u64(7)) * slices *
+                       (bits ? bits : 32) / 8;
+    return bytes <= (u64(1) << 28) && padded <= (u64(1) << 29) && t.Address() >= (u64(1) << 28);
 }
 /// bbport-order: V# lebih dari 256 MiB (BB_ORDER_BIG_BUFFER=1: pengaman mati).
 bool BbOrderRejectBigBuffer(u64 size) {
@@ -3340,6 +3348,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         auto& desc_entry =
             prepared ? CachedImageDescEntry(tsharp, image_desc, prepared->image_hashes[image_index])
                      : CachedImageDescEntry(tsharp, image_desc);
+        if (desc_entry.desc.info.guest_size > (512u << 20)) { // bbport-order (26): T# sampah
+            static std::atomic<u32> told{0};
+            if (told.fetch_add(1) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "bbport-order: T# raksasa ditolak {} MB di {:#x}: {}x{} pitch {} layer {} "
+                            "data_format {}",
+                            desc_entry.desc.info.guest_size >> 20, tsharp.Address(), tsharp.width + 1,
+                            tsharp.height + 1, tsharp.Pitch(), tsharp.NumLayers(), u32(data_fmt));
+            }
+            image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
+            image_binding_entries.push_back(nullptr);
+            binding_proxy_ok.push_back(false);
+            image_descriptor_array_sizes.push_back(1);
+            continue;
+        }
         // BB_SCENE_DEBUG: proxied scene targets this binding reads at the native size, and why.
         const auto debug_native = [&](const VideoCore::Image& image) {
             if (!scene_debug_frame || proxy_candidate || !image.scene_proxy) return;

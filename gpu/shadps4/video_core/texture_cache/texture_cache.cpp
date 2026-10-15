@@ -1,3 +1,4 @@
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -1027,6 +1028,19 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
+    if (image.info.guest_size > (256u << 20)) { // bbport-order: asal image raksasa (freeze)
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "bbport-order: image raksasa {} MB di {:#x}: {}x{}x{} pitch {} layer {} mip {} "
+                        "sampel {} format {} tipe {} tile {} depth {}",
+                        image.info.guest_size >> 20, image.info.guest_address, image.info.size.width,
+                        image.info.size.height, image.info.size.depth, image.info.pitch,
+                        image.info.resources.layers, image.info.resources.levels,
+                        image.info.num_samples, vk::to_string(image.info.pixel_format),
+                        u32(image.info.type), u32(image.info.tile_mode), u32(image.info.props.is_depth));
+        }
+    }
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     BbStats::live_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024),
                                         std::memory_order_relaxed);

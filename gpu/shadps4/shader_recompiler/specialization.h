@@ -87,11 +87,7 @@ struct SamplerSpecialization {
 /// semua shader membuat The Order macet di layar hitam saat boot.
 inline bool IsPlainNull2DCompatible(const ImageSpecialization& s, u64 pgm_hash) {
     static const bool strict = std::getenv("BB_ORDER_STRICT_PERM") != nullptr;
-    static const u64 only = [] {
-        const char* e = std::getenv("BB_ORDER_LOOSE_SHADER");
-        return e ? u64(std::strtoull(e, nullptr, 16)) : u64(0x804aeead);
-    }();
-    return !strict && only != 0 && pgm_hash == only && s.type == AmdGpu::ImageType::Color2D &&
+    return !strict && BbOrderHashListed("BB_ORDER_LOOSE_SHADER", pgm_hash) && s.type == AmdGpu::ImageType::Color2D &&
            !s.is_integer && !s.is_storage && !s.is_cube && !s.is_srgb && s.num_bindings <= 1 &&
            s.num_conversion == AmdGpu::NumberConversion::None;
 }

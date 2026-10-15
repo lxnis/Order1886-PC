@@ -223,7 +223,9 @@ struct ComputeProgram {
 
 static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-    if (code[0] == token_mov_vcchi) {
+    // bbport-dmc (dibawa ke order1886): offset di literal hanya dipercaya di dalam jendela pencarian;
+    // offset palsu (DmC di Windows: baca di luar memori guest) jatuh ke pencarian biasa.
+    if (code[0] == token_mov_vcchi && (u64(code[1]) + 1) * 2 < 0x4000) {
         const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
         if (info->Valid()) {
             return *info;
