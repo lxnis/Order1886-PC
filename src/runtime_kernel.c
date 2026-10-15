@@ -869,7 +869,7 @@ static const RuntimeExport exports[]={
     {"sceImeKeyboardGetResourceId",order_ime_kbd_resource}, {"sceImeKeyboardClose",order_ok},
     {"sceSaveDataDialogIsReadyToDisplay",order_save_dialog_ready},
     {"sceSaveDataDialogGetResult",order_save_dialog_result},
-    {"sceSaveDataDialogClose",order_ok}, {"sceSaveDataDialogProgressBarSetValue",order_ok},
+    {"sceSaveDataDialogProgressBarSetValue",order_ok}, /* Close: runtime_services.c */
     {"sceMsgDialogClose",order_ok}, {"sceMsgDialogProgressBarSetMsg",order_ok},
     {"sceMsgDialogProgressBarSetValue",order_ok},
     {"sceAppContentAddcontMount",order_addcont_none}, {"sceAppContentAddcontUnmount",order_addcont_none},

@@ -1026,6 +1026,15 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    // bbport-order: percobaan diagnosa. BB_ORDER_SKIP_SHADER=804aeead melewati dispatch compute
+    // shader itu (tanpa compile) untuk melihat apakah stutter hilang dan apa yang rusak.
+    static const u64 skip_hash = [] {
+        const char* e = std::getenv("BB_ORDER_SKIP_SHADER");
+        return e ? u64(std::strtoull(e, nullptr, 16)) : u64(0);
+    }();
+    if (skip_hash != 0 && cs_params.hash == skip_hash) {
+        return false;
+    }
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;

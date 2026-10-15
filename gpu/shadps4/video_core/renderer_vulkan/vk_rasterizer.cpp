@@ -538,6 +538,11 @@ bool IsPlausibleImageSize(const AmdGpu::Image& t) {
     // (The Order: image 530 MB di 0x1000 -> GetBarriers assertion).
     return bytes <= (u64(1) << 30) && t.Address() >= (u64(1) << 28);
 }
+/// bbport-order: V# lebih dari 256 MiB (BB_ORDER_BIG_BUFFER=1: pengaman mati).
+bool BbOrderRejectBigBuffer(u64 size) {
+    static const bool allow_big = std::getenv("BB_ORDER_BIG_BUFFER") != nullptr;
+    return !allow_big && size > (u64(256) << 20);
+}
 /// magic_enum::enum_contains, from a table: it scans every enumerator (per texture per draw).
 bool IsKnownFormat(AmdGpu::DataFormat data_fmt, AmdGpu::NumberFormat num_fmt) {
     static const auto tables = [] {
@@ -3157,6 +3162,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                         memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
                 }
                 needs_barrier = true;
+            } else if (BbOrderRejectBigBuffer(vsharp.GetSize())) {
+                // bbport-order: The Order macet di menu karena satu binding ±1,5 GB di-upload
+                // tiap frame. Buffer asli game jauh lebih kecil; yang sebesar ini dianggap sampah
+                // (BB_ORDER_BIG_BUFFER=1 mematikan pengaman ini untuk perbandingan).
+                static std::atomic<u32> told{0};
+                if (told.fetch_add(1) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "bbport-order: V# raksasa ditolak: shader {:#x} slot {} alamat {:#x} "
+                                "ukuran {} MB stride {} tulis {}",
+                                stage.pgm_hash, binding.buffer, vsharp.base_address,
+                                vsharp.GetSize() >> 20, vsharp.GetStride(), desc.is_written);
+                }
+                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (size != vsharp.GetSize()) {

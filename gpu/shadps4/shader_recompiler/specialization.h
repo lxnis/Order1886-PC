@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <bitset>
 
 #include "common/types.h"
@@ -79,6 +81,21 @@ struct SamplerSpecialization {
  * Is separate from runtime information, because resource layout can only be deduced
  * after the first compilation of a module.
  */
+/// bbport-order: apakah texture ini cocok dengan slot yang di-compile kosong (Image::Null:
+/// 2D, float, non-array, bukan storage/cube/srgb, tanpa konversi angka, satu binding).
+/// Hanya untuk shader yang disebut BB_ORDER_LOOSE_SHADER (hex, bawaan 804aeead): aturan untuk
+/// semua shader membuat The Order macet di layar hitam saat boot.
+inline bool IsPlainNull2DCompatible(const ImageSpecialization& s, u64 pgm_hash) {
+    static const bool strict = std::getenv("BB_ORDER_STRICT_PERM") != nullptr;
+    static const u64 only = [] {
+        const char* e = std::getenv("BB_ORDER_LOOSE_SHADER");
+        return e ? u64(std::strtoull(e, nullptr, 16)) : u64(0x804aeead);
+    }();
+    return !strict && only != 0 && pgm_hash == only && s.type == AmdGpu::ImageType::Color2D &&
+           !s.is_integer && !s.is_storage && !s.is_cube && !s.is_srgb && s.num_bindings <= 1 &&
+           s.num_conversion == AmdGpu::NumberConversion::None;
+}
+
 struct StageSpecialization {
     static constexpr size_t MaxStageResources = 128;
 
@@ -235,7 +252,18 @@ struct StageSpecialization {
             }
         }
         for (u32 i = 0; i < images.size(); i++) {
-            if (other.bitset[binding++] && images[i] != other.images[i]) {
+            const u32 slot = binding++;
+            if (!other.bitset[slot]) {
+                continue; // slot baru kosong: modul mana pun bisa melayaninya
+            }
+            // bbport-order: slot kosong di modul ini di-compile sebagai Image::Null = 2D float,
+            // non-array (spirv ImageType). Texture 2D biasa yang sekarang mengisi slot itu bisa
+            // memakai modul yang sama. Compute shader The Order 0x804aeead (streaming texture,
+            // +-30 slot) tanpa aturan ini membuat >1000 permutasi. BB_ORDER_STRICT_PERM=1: aturan lama.
+            if (!bitset[slot] && IsPlainNull2DCompatible(other.images[i], info ? info->pgm_hash : 0)) {
+                continue;
+            }
+            if (images[i] != other.images[i]) {
                 return false;
             }
         }

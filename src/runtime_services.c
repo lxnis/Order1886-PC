@@ -209,7 +209,17 @@ static ABI int32_t save_open(const uint8_t *p) {
         printf("Runtime: bbport-order SaveDataDialog mode=%u dispType=%u sysMsgType=%d errorCode=%#x userMsgButtons=%d\n",
                mode,disp,sys ? (int)sys[0] : -1,err ? (unsigned)err[0] : 0u,user ? (int)user[0] : -1);
     }
-    return dialog_open(2);
+    const int32_t r=dialog_open(2);
+    /* bbport-order: mode 5 = progress bar. Game menunggu RUNNING, menyimpan, lalu memanggil
+     * sceSaveDataDialogClose dan menunggu FINISHED. Langsung FINISHED membuatnya membuka ulang
+     * dialog tanpa henti (The Order: 1281 kali, save tidak pernah di-mount). */
+    if (!r && p && *(const uint32_t *)(p+52)==5) dialogs[2].status=2;
+    return r;
+}
+static ABI int32_t save_close(const void *param) {
+    (void)param;
+    if (dialogs[2].status==2) dialogs[2].status=3;
+    return 0;
 }
 static ABI int32_t save_status(void) { return dialog_status(2); }
 static ABI int32_t save_term(void) { return dialog_term(2); }
@@ -529,6 +539,7 @@ static const RuntimeExport exports[]={
     {"sceMsgDialogUpdateStatus",msg_status}, {"sceMsgDialogTerminate",msg_term},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceSaveDataDialogClose",save_close}, {"sceSaveDataDialogGetStatus",save_status}, /* bbport-order */
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
     {"sceNpProfileDialogGetResult",profile_result},
