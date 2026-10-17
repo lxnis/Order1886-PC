@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/debug_print.h"
@@ -202,11 +206,36 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
+// bbport-order (55): BB_ORDER_NODISCARD=log|1 -> catat shader dengan discard; 1 = matikan discard.
+static int BbOrderNoDiscard(EmitContext& ctx) {
+    static const int mode = [] {
+        const char* e = std::getenv("BB_ORDER_NODISCARD");
+        return e == nullptr ? 0 : (e[0] == '1' ? 2 : 1);
+    }();
+    if (mode != 0) {
+        static std::mutex m;
+        static std::unordered_set<u64> told;
+        std::scoped_lock lock{m};
+        if (told.insert(ctx.info.pgm_hash).second) {
+            std::printf("bbport-order (55): discard di shader %llx%s\n",
+                        (unsigned long long)ctx.info.pgm_hash, mode == 2 ? " (dimatikan)" : "");
+            std::fflush(stdout);
+        }
+    }
+    return mode;
+}
+
 void EmitDiscard(EmitContext& ctx) {
+    if (BbOrderNoDiscard(ctx) == 2) {
+        return;
+    }
     ctx.OpDemoteToHelperInvocationEXT();
 }
 
 void EmitDiscardCond(EmitContext& ctx, Id condition) {
+    if (BbOrderNoDiscard(ctx) == 2) {
+        return;
+    }
     const Id kill_label{ctx.OpLabel()};
     const Id merge_label{ctx.OpLabel()};
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);

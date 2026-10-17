@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstring>
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/position.h"
 #include "shader_recompiler/ir/reinterpret.h"
@@ -8,6 +10,30 @@
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Gcn {
+
+// bbport-order (40): BB_ORDER_NANFIX = all | hash,hash (hex). NaN di ekspor MRT -> 0, clamp +-65504.
+static bool BbOrderNanFix(u64 hash) {
+    static const char* e = std::getenv("BB_ORDER_NANFIX");
+    if (e == nullptr || *e == 0) {
+        return false;
+    }
+    if (std::strcmp(e, "all") == 0 || std::strcmp(e, "1") == 0) {
+        return true;
+    }
+    const char* p = e;
+    while (*p != 0) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(p, &end, 16);
+        if (end == p) {
+            break;
+        }
+        if (v == hash) {
+            return true;
+        }
+        p = (*end == ',') ? end + 1 : end;
+    }
+    return false;
+}
 
 static AmdGpu::NumberFormat NumberFormatCompressed(AmdGpu::ShaderExportFormat export_format) {
     switch (export_format) {
@@ -113,6 +139,47 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
         if (needs_unorm_fixup) {
             // FIXME: Fix-up for GPUs where float-to-unorm rounding is off from expected.
             converted = ir.FPSub(converted, ir.Imm32(1.f / 127500.f));
+        }
+        if (color_buffer.num_format != AmdGpu::NumberFormat::Uint &&
+            color_buffer.num_format != AmdGpu::NumberFormat::Sint &&
+            BbOrderNanFix(info.pgm_hash)) { // bbport-order (40): hanya RT float/unorm
+            static const int dbg = [] { // bbport-order (45): 1 = NaN magenta per komponen, 2 = per piksel
+                const char* e = std::getenv("BB_ORDER_NANFIX_DEBUG");
+                return e == nullptr ? 0 : (e[0] == '2' ? 2 : 1);
+            }();
+            static const bool min0 = std::getenv("BB_ORDER_NANFIX_MIN0") != nullptr;
+            const IR::F32 v{converted};
+            if (dbg == 2) {
+                // Status per piksel dari semua komponen warna (bukan alpha).
+                const IR::F32 zero{ir.Imm32(0.0f)};
+                const IR::F32 big{ir.Imm32(65504.0f)};
+                IR::U1 any_nan{ir.Imm1(false)}, any_neg{ir.Imm1(false)}, any_big{ir.Imm1(false)};
+                for (u32 k = 0; k < 3; ++k) {
+                    const auto ck = components[color_buffer.swizzle.Map(k)];
+                    if (ck.IsEmpty()) {
+                        continue;
+                    }
+                    const IR::F32 vk{ApplyWriteNumberConversion(ir, ck, color_buffer.num_conversion)};
+                    any_nan = ir.LogicalOr(any_nan, ir.FPIsNan(vk));
+                    any_neg = ir.LogicalOr(any_neg, ir.FPLessThan(vk, zero));
+                    any_big = ir.LogicalOr(any_big, ir.FPGreaterThan(IR::F32{ir.FPAbs(vk)}, big));
+                }
+                const float mag = (i == 0 || i == 2) ? 8.0f : 0.0f;
+                const float grn = (i == 1) ? 8.0f : 0.0f;
+                const float blu = (i == 2) ? 8.0f : 0.0f;
+                const IR::F32 keep{i == 3 ? IR::F32{ir.Select(ir.FPIsNan(v), zero, v)} : v};
+                IR::F32 out{ir.Select(any_big, ir.Imm32(blu), keep)};
+                out = IR::F32{ir.Select(any_neg, ir.Imm32(grn), out)};
+                out = IR::F32{ir.Select(any_nan, ir.Imm32(mag), out)};
+                converted = i == 3 ? keep : out;
+            } else {
+                const IR::F32 repl{ir.Imm32((dbg == 1 && i != 1 && i != 3) ? 1.0f : 0.0f)};
+                IR::F32 clean{ir.Select(ir.FPIsNan(v), repl, v)};
+                if (min0) {
+                    clean = IR::F32{ir.FPMax(clean, ir.Imm32(0.0f))};
+                }
+                converted = IR::F32{ir.FPClamp(clean, ir.Imm32(-65504.0f), ir.Imm32(65504.0f))};
+            }
         }
         ir.SetAttribute(mrt, converted, i);
     }

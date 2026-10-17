@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <vector>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -5,6 +7,56 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
+
+
+// bbport-order (68): BB_ORDER_EXACTVS = 1 (VS wajah) | all | hash,hash
+static int BbOrderExactMode(u64 hash) {
+    static const char* env = std::getenv("BB_ORDER_EXACTVS");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+        return 0;
+    }
+    if (env[0] == 'a') {
+        return 1;
+    }
+    static const std::vector<u64> list = [] {
+        std::vector<u64> out;
+        const char* p = (env[0] == '1' && env[1] == '\0')
+                            ? "1077f760,70b542d,e0ec7fe0,429d950d,bd739cf5,231d370b,190852fd,"
+                              "b2cc4b8f,b938dd39,a369ab85,59c67371,fd7e121b,b68b212f"
+                            : env;
+        while (*p) {
+            char* end = nullptr;
+            const u64 v = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            out.push_back(v);
+            p = (*end == ',') ? end + 1 : end;
+        }
+        return out;
+    }();
+    for (const u64 h : list) {
+        if (h == hash) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool BbOrderExact(EmitContext& ctx) {
+    return ctx.info.uses_fp64 && ctx.info.sw_stage == SwStage::Vertex &&
+           BbOrderExactMode(ctx.info.pgm_hash) != 0;
+}
+
+// fp32 op lewat fp64: hasil kali dua fp32 pas di fp64, dibulatkan sekali ke fp32 = IEEE fp32 tepat.
+template <typename F>
+static Id BbOrderExactOp(EmitContext& ctx, Id a, Id b, F&& op) {
+    const Id a64 = ctx.OpFConvert(ctx.F64[1], a);
+    const Id b64 = ctx.OpFConvert(ctx.F64[1], b);
+    const Id r64 = op(a64, b64);
+    ctx.Decorate(r64, spv::Decoration::NoContraction);
+    return ctx.OpFConvert(ctx.F32[1], r64);
+}
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     ctx.Decorate(op, spv::Decoration::NoContraction);
@@ -20,6 +72,9 @@ Id EmitFPAbs64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+    if (BbOrderExact(ctx)) { // bbport-order (68)
+        return BbOrderExactOp(ctx, a, b, [&](Id x, Id y) { return ctx.OpFAdd(ctx.F64[1], x, y); });
+    }
     return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
 }
 
@@ -28,6 +83,9 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+    if (BbOrderExact(ctx)) { // bbport-order (68)
+        return BbOrderExactOp(ctx, a, b, [&](Id x, Id y) { return ctx.OpFSub(ctx.F64[1], x, y); });
+    }
     return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
 }
 
@@ -78,6 +136,9 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+    if (BbOrderExact(ctx)) { // bbport-order (68)
+        return BbOrderExactOp(ctx, a, b, [&](Id x, Id y) { return ctx.OpFMul(ctx.F64[1], x, y); });
+    }
     return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 

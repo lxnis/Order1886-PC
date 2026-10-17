@@ -78,7 +78,7 @@ void AddSampled(Entry& entry) {
 }
 
 void AddShader(Entry& entry, u64 hash) {
-    if (entry.shaders.size() < 8 && std::ranges::find(entry.shaders, hash) == entry.shaders.end()) {
+    if (entry.shaders.size() < 64 /* bbport-order (44) */ && std::ranges::find(entry.shaders, hash) == entry.shaders.end()) {
         entry.shaders.push_back(hash);
     }
 }

@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -192,7 +193,12 @@ void CFG::SplitDivergenceScopes() {
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
                 // If there are no instructions inside scope don't do anything.
                 if (index - curr_begin == 1 && is_close) {
-                    curr_begin = -1;
+                    // bbport-order (54): shadPS4 c34ca21 (#5220), instruksi penutup bisa membuka scope baru
+                    static const bool keep = [] {
+                        const char* e = std::getenv("BB_ORDER_EXECSCOPE");
+                        return e == nullptr || e[0] != '0';
+                    }();
+                    curr_begin = (keep && is_open_scope(inst)) ? static_cast<s32>(index) : -1;
                     continue;
                 }
                 // If all instructions in the scope ignore exec masking, we shouldn't insert a

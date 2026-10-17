@@ -357,6 +357,12 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
+public:
+    /// bbport-order (52): level 0 image warna ditulis mentah ke BB_ORDER_DIAG_DIR (diagnosa).
+    void BbOrderDumpImage(ImageId image_id, const char* tag);
+
+private:
+
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
 

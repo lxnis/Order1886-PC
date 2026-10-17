@@ -757,6 +757,15 @@ void UpdateTextInput(SDL_Window* window) {
     }
 }
 
+// bbport-order (82): menu overlay Bloodborne hanya dengan BB_ORDER_MENU=1.
+static bool BbOrderMenuKeys() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_MENU");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 bool HandleEvent(const SDL_Event& event) {
     std::scoped_lock lock{imgui_mutex};
     if (!initialized) {
@@ -769,7 +778,7 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
         if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
+            ((BbOrderMenuKeys() && event.key.key == SDLK_INSERT) || (is_open && event.key.key == SDLK_ESCAPE))) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
@@ -793,7 +802,7 @@ bool HandleEvent(const SDL_Event& event) {
         } else if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
             r3_down = down;
         }
-        if (down && l3_down && r3_down) {
+        if (down && l3_down && r3_down && BbOrderMenuKeys()) { // bbport-order (82)
             SetOpen(!is_open);
             return true;
         }

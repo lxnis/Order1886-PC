@@ -1,7 +1,11 @@
+#include <cstdio>
+#include <algorithm>
+#include <vector>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <exception> // bbport-order (98)
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -238,6 +242,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
               !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
              lowers_user_clip_planes) &&
             profile.needs_clip_distance_emulation;
+        if (info.hw.fs.clip_distance_emulation) { // bbport-order (53)
+            static std::atomic<u32> told53{0};
+            if (told53.fetch_add(1) < 32) {
+                std::printf("bbport-order (53): emulasi clip distance (clip_distance_enable %u, user "
+                            "plane %u)\n",
+                            u32(regs.vs_output_control.clip_distance_enable),
+                            u32(regs.clipper_control.user_clip_plane_enable));
+                std::fflush(stdout);
+            }
+        }
         break;
     }
     case HwStage::Compute: {
@@ -352,7 +366,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
-        .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+        .needs_clip_distance_emulation = // bbport-order (53): BB_ORDER_CLIPEMU=0 mematikan
+            instance.GetDriverID() == vk::DriverId::eNvidiaProprietary && [] {
+                const char* e = std::getenv("BB_ORDER_CLIPEMU");
+                return e == nullptr || e[0] != '0';
+            }(),
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         // bbport BB_LAYER_MEMORY: buffers over nearly all memory go through the page table.
         .paged_buffers = VideoCore::BufferCache::LayerPagedActive(),
@@ -492,6 +510,12 @@ struct TargetStreak {
     u32 frames = 0;
 };
 std::unordered_map<u64, TargetStreak> target_streaks;
+// bbport-order (86): kenapa draw terakhir tidak boleh compile di belakang
+int bb_async_why = 0;
+u64 bb_async_draws = 0;
+u32 bb_async_streak = 0;
+const char* const bb_async_names[] = {"-", "BB_ASYNC_PIPELINES=0", "tanpa vertex input dinamis",
+    "tanpa regs", "frame < 300 draw", "indirect", "layar penuh", "target belum 8 frame"};
 
 /// The draw's render target: its first color buffer written, else its depth buffer, else 0.
 u64 DrawTarget(const AmdGpu::Regs& regs) {
@@ -603,9 +627,68 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         CompileTimer timer;
 
         GraphicsPipeline::SerializationSupport sdata{};
+        const auto bb_p0 = std::chrono::steady_clock::now(); // bbport-order (85)
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+        if (const double bb_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - bb_p0).count(); bb_ms > 15.0) {
+            LOG_WARNING(Render_Vulkan, "bbport-order (85): pipeline {:#x} di thread GPU = {:.1f} ms "
+                        "(ps {:#x}, vs {:#x}; async tidak: {}, {} draw/frame, target {} frame, {} indeks)", // (86)
+                        pipeline_hash, bb_ms,
+                        sel.infos[u32(Shader::SwStage::Fragment)] ? sel.infos[u32(Shader::SwStage::Fragment)]->pgm_hash : 0,
+                        sel.infos[u32(Shader::SwStage::Vertex)] ? sel.infos[u32(Shader::SwStage::Vertex)]->pgm_hash : 0,
+                        bb_async_names[bb_async_why], bb_async_draws, bb_async_streak,
+                        sel.regs ? u32(sel.regs->num_indices) : 0u);
+            // bbport-order (87): field kunci yang berbeda dari pipeline lain dengan shader yang sama
+            const GraphicsPipelineKey& nk = sel.graphics_key;
+            for (auto it2 = graphics_pipelines.begin(); it2 != graphics_pipelines.end(); ++it2) {
+                const GraphicsPipelineKey& ok = it2->first;
+                if (ok == nk || ok.stage_hashes != nk.stage_hashes) {
+                    continue;
+                }
+                std::string d;
+                auto hex = [](const void* p, size_t n) {
+                    std::string s;
+                    for (size_t j = 0; j < n && j < 8; ++j) s += fmt::format("{:02x}", static_cast<const u8*>(p)[j]);
+                    return s;
+                };
+                auto arr = [&](const char* name, const auto& a, const auto& b) {
+                    for (size_t j = 0; j < a.size(); ++j) {
+                        if (std::memcmp(&a[j], &b[j], sizeof(a[j])) != 0) {
+                            d += fmt::format(" {}[{}] {}->{}", name, j, hex(&b[j], sizeof(b[j])), hex(&a[j], sizeof(a[j])));
+                        }
+                    }
+                };
+                auto one = [&](const char* name, u64 a, u64 b) {
+                    if (a != b) d += fmt::format(" {} {}->{}", name, b, a);
+                };
+                arr("vbfmt", nk.vertex_buffer_formats, ok.vertex_buffer_formats);
+                one("pcp", nk.patch_control_points, ok.patch_control_points);
+                one("ncolor", nk.num_color_attachments, ok.num_color_attachments);
+                arr("cb", nk.color_buffers, ok.color_buffers);
+                arr("blend", nk.blend_controls, ok.blend_controls);
+                arr("wmask", nk.write_masks, ok.write_masks);
+                one("cbmask", u64(nk.cb_shader_mask.raw), u64(ok.cb_shader_mask.raw));
+                one("logic", u64(nk.logic_op), u64(ok.logic_op));
+                one("samples", nk.num_samples, ok.num_samples);
+                one("zsamples", nk.depth_samples, ok.depth_samples);
+                arr("csamples", nk.color_samples, ok.color_samples);
+                one("mrt", nk.mrt_mask, ok.mrt_mask);
+                one("mv", nk.motion_vectors, ok.motion_vectors);
+                one("zfmt", u64(nk.z_format), u64(ok.z_format));
+                one("sfmt", u64(nk.stencil_format), u64(ok.stencil_format));
+                one("zclamp", nk.depth_clamp_enable, ok.depth_clamp_enable);
+                one("prim", u64(nk.prim_type), u64(ok.prim_type));
+                one("poly", u64(nk.polygon_mode), u64(ok.polygon_mode));
+                one("clip", u64(nk.clip_space), u64(ok.clip_space));
+                one("pvtx", u64(nk.provoking_vtx_last), u64(ok.provoking_vtx_last));
+                one("zclip", nk.depth_clip_enable, ok.depth_clip_enable);
+                LOG_WARNING(Render_Vulkan, "bbport-order (87): beda kunci dari pipeline lain shader sama:{}",
+                            d.empty() ? " (tidak ada field berbeda?)" : d);
+                break;
+            }
+        }
 
         RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -650,6 +733,11 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
         const char* env = std::getenv("BB_ASYNC_PIPELINES");
         return !(env && env[0] == '0');
     }();
+    static const int bb_all = [] { // bbport-order (86/87): 1 = aturan longgar, 2 = + indirect
+        const char* e = std::getenv("BB_ORDER_ASYNC_ALL");
+        return e ? std::atoi(e) : 0;
+    }();
+    bb_async_why = !enabled ? 1 : !instance.IsVertexInputDynamicState() ? 2 : !selection.regs ? 3 : 0;
     if (!enabled || !instance.IsVertexInputDynamicState() || !selection.regs) {
         return false;
     }
@@ -672,14 +760,20 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
             async_started = async_skipped = async_waited = 0;
         }
     }
-    if (last_frame_draws < 300) {
+    bb_async_draws = last_frame_draws;
+    if (last_frame_draws < 300 && !bb_all && (bb_async_why = 4, true)) { // bbport-order (86)
         return false;
     }
     // A full-screen pass (one triangle or quad: lighting, fog, post-processing) waits for its
     // pipeline: going without one for a frame left whole frames grey. So does an indirect draw
     // (its size unknown here). What may go without is geometry, which shows a frame later.
     constexpr u32 FullScreenIndices = 12;
-    if (indirect || selection.regs->num_indices <= FullScreenIndices) {
+    static const bool bb_ind = [] { // bbport-order (88): indirect di belakang bila tiap frame
+        const char* e = std::getenv("BB_ORDER_ASYNC_INDIRECT");
+        return !(e && e[0] == '0');
+    }();
+    if (((indirect && bb_all < 2 && !bb_ind) || (!indirect && selection.regs->num_indices <= FullScreenIndices)) &&
+        (bb_async_why = indirect ? 5 : 6, true)) { // bbport-order (86/87/88)
         return false;
     }
     // A pass drawn every frame: its render target drawn to in each of the last 8 frames (the
@@ -689,7 +783,13 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
     constexpr u32 PerFrameStreak = 8;
     const u64 target = DrawTarget(*selection.regs);
     const auto streak = target_streaks.find(target);
-    return target != 0 && streak != target_streaks.end() && streak->second.frames >= PerFrameStreak;
+    const bool bb_ok = target != 0 && streak != target_streaks.end() &&
+                       streak->second.frames >= PerFrameStreak; // bbport-order (86)
+    if (!bb_ok) {
+        bb_async_why = 7;
+        bb_async_streak = streak != target_streaks.end() ? streak->second.frames : 0;
+    }
+    return bb_ok || (bb_all >= 1 && target != 0 && !indirect); // bbport-order (88)
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -717,6 +817,17 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
+// bbport-order (98): assertion -> exception selama pemilihan pipeline (shim/common/assert.cpp)
+extern "C" int* BbOrderAssertThrow();
+static void BbOrderBadShader(const char* what, u64 hash) {
+    static std::atomic<u32> told{0};
+    if (told.fetch_add(1) < 20) {
+        std::printf("bbport-order (98): shader %llx gagal (%s) -> draw/dispatch dilewati\n",
+                    (unsigned long long)hash, what);
+        std::fflush(stdout);
+    }
+}
+
 bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     std::memset(&sel.graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = (*sel.regs);
@@ -741,6 +852,13 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     key.depth_samples = db_enabled ? regs.depth_buffer.NumSamples() : 1;
     key.num_samples = key.depth_samples;
     key.cb_shader_mask = regs.color_shader_mask;
+    { // bbport-order (43): DB_ALPHA_TO_MASK (context reg 0xA2DC) bit 0 = ALPHA_TO_MASK_ENABLE
+        static const bool a2c_on = [] {
+            const char* e = std::getenv("BB_ORDER_A2C");
+            return e == nullptr || e[0] != '0';
+        }();
+        key.alpha_to_coverage = (a2c_on && (regs.reg_array[0xA2DC] & 1u) != 0) ? 1u : 0u;
+    }
 
     const bool skip_cb_binding =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
@@ -787,7 +905,17 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages(sel)) {
+    bool bb_stages_ok = false; // bbport-order (98)
+    ++*BbOrderAssertThrow();
+    try {
+        bb_stages_ok = RefreshGraphicsStages(sel);
+    } catch (const std::exception& e) {
+        const auto* bb_ps = sel.regs ? sel.regs->ProgramForStage(u32(HwStage::Fragment)) : nullptr;
+        BbOrderBadShader(e.what(), bb_ps && bb_ps->Address<u32*>() ? AmdGpu::GetParams(*bb_ps).hash : 0);
+        bb_stages_ok = false;
+    }
+    --*BbOrderAssertThrow();
+    if (!bb_stages_ok) {
         return false;
     }
     if (motion_possible) {
@@ -935,6 +1063,37 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     sel.modules.fill(nullptr);
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
+    { // bbport-order (36): BB_ORDER_SKIP_PS=hex,hex melewati draw dengan pixel shader itu (diagnosa)
+        static const std::vector<u64> skip_ps = [] {
+            std::vector<u64> out;
+            if (const char* e = std::getenv("BB_ORDER_SKIP_PS")) {
+                std::string s{e};
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    const size_t comma = s.find(',', pos);
+                    const std::string item = s.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                                        : comma - pos);
+                    if (!item.empty()) {
+                        out.push_back(std::strtoull(item.c_str(), nullptr, 16));
+                    }
+                    if (comma == std::string::npos) {
+                        break;
+                    }
+                    pos = comma + 1;
+                }
+            }
+            return out;
+        }();
+        if (!skip_ps.empty()) {
+            const auto* ps = regs.ProgramForStage(static_cast<u32>(HwStage::Fragment));
+            if (ps && ps->Address<u32*>()) {
+                const u64 h = AmdGpu::GetParams(*ps).hash;
+                if (std::find(skip_ps.begin(), skip_ps.end(), h) != skip_ps.end()) {
+                    return false;
+                }
+            }
+        }
+    }
 
     const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -1035,8 +1194,16 @@ bool PipelineCache::RefreshComputeKey() {
     if (skip_hash != 0 && cs_params.hash == skip_hash) {
         return false;
     }
-    std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
-        GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
+    ++*BbOrderAssertThrow(); // bbport-order (98)
+    try {
+        std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
+            GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
+    } catch (const std::exception& e) {
+        --*BbOrderAssertThrow();
+        BbOrderBadShader(e.what(), cs_params.hash);
+        return false;
+    }
+    --*BbOrderAssertThrow();
     return true;
 }
 
@@ -1047,9 +1214,13 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     CompileTimer timer;
+    using BbClk = std::chrono::steady_clock; // bbport-order (85): waktu per tahap
+    const auto bb_t0 = BbClk::now();
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const auto bb_t1 = BbClk::now();
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    const auto bb_t2 = BbClk::now();
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -1062,8 +1233,21 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     } else {
         module = CompileSPV(spv, instance.GetDevice());
     }
+    const auto bb_t3 = BbClk::now();
+    const size_t bb_words = spv.size();
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    {
+        const auto bb_t4 = BbClk::now();
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        if (ms(bb_t0, bb_t4) > 15.0) {
+            LOG_WARNING(Render_Vulkan,
+                        "bbport-order (85): compile shader {:#x} perm {} = {:.1f} ms (terjemah {:.1f}, "
+                        "spirv {:.1f}, modul {:.1f}, simpan {:.1f}; {} kata, {} inst GCN)",
+                        info.pgm_hash, perm_idx, ms(bb_t0, bb_t4), ms(bb_t0, bb_t1), ms(bb_t1, bb_t2),
+                        ms(bb_t2, bb_t3), ms(bb_t3, bb_t4), bb_words, code.size());
+        }
+    }
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
@@ -1097,10 +1281,13 @@ static void BbOrderLogPermutation(u64 hash, size_t perm_idx, const Shader::Stage
     }
     for (size_t i = 0; i < a.images.size() && i < b.images.size(); ++i) {
         if (!(a.images[i] == b.images[i])) {
-            why += fmt::format(" img{}(type {}->{} int {}->{} cube {}->{} binds {}->{})", i,
+            why += fmt::format(" img{}(type {}->{} int {}->{} cube {}->{} binds {}->{} srgb {}->{} conv {}->{} st {}->{})", i, // bbport-order (85)
                                u32(b.images[i].type), u32(a.images[i].type), b.images[i].is_integer,
                                a.images[i].is_integer, b.images[i].is_cube, a.images[i].is_cube,
-                               b.images[i].num_bindings, a.images[i].num_bindings);
+                               b.images[i].num_bindings, a.images[i].num_bindings,
+                               b.images[i].is_srgb, a.images[i].is_srgb,
+                               u32(b.images[i].num_conversion), u32(a.images[i].num_conversion),
+                               b.images[i].is_storage, a.images[i].is_storage);
         }
     }
     for (size_t i = 0; i < a.samplers.size() && i < b.samplers.size(); ++i) {

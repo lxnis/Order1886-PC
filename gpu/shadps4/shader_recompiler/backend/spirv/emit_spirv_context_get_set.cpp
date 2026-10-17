@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -70,6 +71,27 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     }
 }
 
+// bbport-order (89): dword dari alamat buffer yang tidak rata 4 byte (alamat V# + 1..3).
+static bool BbOrderUnalignedOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_UNALIGNED"); // bbport-order (90): bawaan mati
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+/// lo/hi = dword ke-n dan ke-n+1 (u32). Hasil = 4 byte mulai (buf_off & 3) di dalam lo.
+static Id BbOrderJoinUnaligned(EmitContext& ctx, Id byte_off, Id lo, Id hi) {
+    const Id sh = ctx.OpShiftLeftLogical(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], byte_off, ctx.ConstU32(3u)),
+                                         ctx.ConstU32(3u));
+    const Id aligned = ctx.OpIEqual(ctx.U1[1], sh, ctx.u32_zero_value);
+    const Id back = ctx.OpSelect(ctx.U32[1], aligned, ctx.u32_zero_value,
+                                 ctx.OpISub(ctx.U32[1], ctx.ConstU32(32u), sh));
+    const Id joined = ctx.OpBitwiseOr(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], lo, sh),
+                                      ctx.OpShiftLeftLogical(ctx.U32[1], hi, back));
+    return ctx.OpSelect(ctx.U32[1], aligned, lo, joined);
+}
+
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
@@ -78,7 +100,22 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
     const Id result{ctx.OpLoad(ctx.U32[1], ptr)};
+    if (const Id byte_off = buffer.Offset(PointerSize::B8);
+        BbOrderUnalignedOn() && !buffer.paged && Sirit::ValidId(byte_off)) { // bbport-order (89)
+        const Id next = ctx.OpIAdd(ctx.U32[1], index, ctx.ConstU32(1u));
+        const Id hi{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, next))};
+        return BbOrderJoinUnaligned(ctx, byte_off, result, hi);
+    }
     return result;
+}
+
+// bbport-order (51): BaryCoordKHR = (b0, b1, b2); GCN I/J = bobot verteks 1/2 -> komponen comp + 1.
+static u32 BbOrderBaryComp(const EmitContext& ctx, u32 comp) {
+    static const bool fix = [] { // bawaan MATI: dengan ini layar rusak total (16 Okt 23:21)
+        const char* e = std::getenv("BB_ORDER_BARYFIX");
+        return e != nullptr && e[0] == '1';
+    }();
+    return (fix && !ctx.profile.supports_amd_shader_explicit_vertex_parameter) ? comp + 1 : comp;
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
@@ -148,7 +185,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
             return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
                                                             ctx.ConstU32(comp)));
         } else {
-            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord),
+                                          BbOrderBaryComp(ctx, comp)); // bbport-order (51)
         }
     case IR::Attribute::BaryCoordSmoothCentroid:
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
@@ -157,7 +195,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                                                 ctx.ConstU32(comp)));
         } else {
             return ctx.OpCompositeExtract(
-                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord), comp);
+                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord),
+                BbOrderBaryComp(ctx, comp)); // bbport-order (51)
         }
     case IR::Attribute::BaryCoordSmoothSample:
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
@@ -169,15 +208,16 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                 ctx.F32[1],
                 ctx.OpInterpolateAtSample(ctx.F32[3], ctx.bary_coord,
                                           ctx.OpLoad(ctx.U32[1], ctx.sample_index)),
-                comp);
+                BbOrderBaryComp(ctx, comp)); // bbport-order (51)
         }
     case IR::Attribute::BaryCoordNoPersp:
         return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp,
-                                                        ctx.ConstU32(comp)));
+                                                        ctx.ConstU32(BbOrderBaryComp(ctx, comp)))); // bbport-order (51)
     case IR::Attribute::BaryCoordNoPerspSample:
         return ctx.OpLoad(
             ctx.F32[1],
-            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp_sample, ctx.ConstU32(comp)));
+            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp_sample,
+                              ctx.ConstU32(BbOrderBaryComp(ctx, comp)))); // bbport-order (51)
     case IR::Attribute::BaryCoordPullModel: {
         ASSERT_MSG(comp < 3, "Invalid BaryCoordPullModel component {}", comp);
 
@@ -439,6 +479,22 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
 
     boost::container::static_vector<Id, N> ids;
+    // bbport-order (89): alamat buffer tidak rata 4 byte -> N+1 dword, gabungkan yang berdampingan.
+    if (const Id byte_off = spv_buffer.Offset(PointerSize::B8);
+        BbOrderUnalignedOn() && !spv_buffer.paged && Sirit::ValidId(byte_off)) {
+        boost::container::static_vector<Id, N + 1> raw;
+        for (u32 i = 0; i <= N; i++) {
+            const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+            const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
+            const Id v = ctx.OpLoad(data_types[1], ptr_i);
+            raw.push_back(alias == PointerType::U32 ? v : ctx.OpBitcast(ctx.U32[1], v));
+        }
+        for (u32 i = 0; i < N; i++) {
+            const Id j = BbOrderJoinUnaligned(ctx, byte_off, raw[i], raw[i + 1]);
+            ids.push_back(alias == PointerType::U32 ? j : ctx.OpBitcast(ctx.F32[1], j));
+        }
+        return N == 1 ? ids[0] : ctx.OpCompositeConstruct(data_types[N], ids);
+    }
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
         if (spv_buffer.paged) {

@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -496,6 +497,40 @@ void Translator::IMAGE_STORE(bool has_mip, const GcnInst& inst) {
             continue;
         }
         comps.push_back(ir.GetVectorReg<IR::F32>(data_reg++));
+    }
+    { // bbport-order (46): BB_ORDER_STORENAN = hash,hash -> NaN di image store compute dibersihkan
+        static const char* list = std::getenv("BB_ORDER_STORENAN");
+        bool hit = false;
+        if (list != nullptr) {
+            const char* p = list;
+            while (*p != 0) {
+                char* end = nullptr;
+                const unsigned long long v = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                hit |= v == this->info.pgm_hash;
+                p = (*end == ',' || *end == ' ') ? end + 1 : end;
+            }
+        }
+        if (hit) {
+            static const bool dbg = std::getenv("BB_ORDER_STORENAN_DEBUG") != nullptr;
+            IR::U1 any_nan{ir.Imm1(false)};
+            for (u32 i = 0; i < 4; i++) {
+                if (((mimg.dmask >> i) & 1) != 0) {
+                    any_nan = ir.LogicalOr(any_nan, ir.FPIsNan(comps[i]));
+                }
+            }
+            for (u32 i = 0; i < 4; i++) {
+                if (((mimg.dmask >> i) & 1) == 0) {
+                    continue;
+                }
+                const float repl = (dbg && (i == 0 || i == 2)) ? 8.0f : 0.0f;
+                const IR::F32 clean{ir.Select(dbg ? any_nan : ir.FPIsNan(comps[i]),
+                                              ir.Imm32(repl), comps[i])};
+                comps[i] = IR::F32{ir.FPClamp(clean, ir.Imm32(-65504.0f), ir.Imm32(65504.0f))};
+            }
+        }
     }
     const IR::Value value = ir.CompositeConstruct(comps[0], comps[1], comps[2], comps[3]);
     ir.ImageWrite(ir.ImageHandle(tsharp_low, tsharp_high), body, {}, {}, value, info);

@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport-order (75): inputs for DLSS / FSR 3.1 in place of The Order: 1886's TAA (cs 92311aca):
+// the MSAA scene color resolved (tonemap-weighted), the nearest depth sample, the game's motion
+// vectors decoded to render pixels (current to previous).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef SCENE_MS
+layout(binding = 0) uniform texture2DMS scene_tex;
+#else
+layout(binding = 0) uniform texture2D scene_tex;
+#endif
+#ifdef DEPTH_MS
+layout(binding = 1) uniform texture2DMS depth_tex;
+#else
+layout(binding = 1) uniform texture2D depth_tex;
+#endif
+layout(binding = 2) uniform texture2D velocity_tex;
+layout(binding = 3, rgba16f) uniform writeonly image2D color_out;
+layout(binding = 4, r32f) uniform writeonly image2D depth_out;
+layout(binding = 5, rg16f) uniform writeonly image2D motion_out;
+
+layout(push_constant) uniform Params {
+    float velocity_scale;
+    uint width;
+    uint height;
+    uint pad;
+};
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(width) || p.y >= int(height)) {
+        return;
+    }
+#ifdef SCENE_MS
+    vec3 sum = vec3(0.0);
+    float weights = 0.0;
+    const int samples = textureSamples(scene_tex);
+    for (int s = 0; s < samples; ++s) {
+        const vec3 c = max(texelFetch(scene_tex, p, s).rgb, vec3(0.0));
+        const float w = 1.0 / (1.0 + dot(c, vec3(0.299, 0.587, 0.114)));
+        sum += c * w;
+        weights += w;
+    }
+    const vec3 color = sum / max(weights, 1e-6);
+#else
+    const vec3 color = max(texelFetch(scene_tex, p, 0).rgb, vec3(0.0));
+#endif
+#ifdef DEPTH_MS
+    float depth = 1.0;
+    const int depth_samples = textureSamples(depth_tex);
+    for (int s = 0; s < depth_samples; ++s) {
+        depth = min(depth, texelFetch(depth_tex, p, s).r);
+    }
+#else
+    const float depth = texelFetch(depth_tex, p, 0).r;
+#endif
+    const vec4 v = texelFetch(velocity_tex, p, 0);
+    const uint signs = uint(v.w * 3.0 + 0.5);
+    const float mx = -v.x * (((signs & 1u) != 0u) ? -1.0 : 1.0);
+    const float my = (((signs & 2u) != 0u) ? 1.0 : -1.0) * v.y;
+    imageStore(color_out, p, vec4(color, 1.0));
+    imageStore(depth_out, p, vec4(depth));
+    imageStore(motion_out, p, vec4(velocity_scale * mx, velocity_scale * my, 0.0, 0.0));
+}

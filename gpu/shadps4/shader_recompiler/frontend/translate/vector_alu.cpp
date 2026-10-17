@@ -1,3 +1,5 @@
+#include <cstring>
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -7,6 +9,19 @@
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Gcn {
+
+// bbport-order (27b): BB_ORDER_LEGACY berisi huruf: d = V_MAD_LEGACY, c = V_MAC_LEGACY, r = V_RSQ_CLAMP.
+// Semua aktif bersamaan membuat layar hitam saat boot (16 Okt 01:30), jadi bawaan mati.
+// bbport-order (39): BB_ORDER_FPCLAMP: c = V_RCP_CLAMP, l = V_RSQ_LEGACY, a = semua RCP/RSQ.
+static bool BbOrderFpClamp(char k) {
+    static const char* e = std::getenv("BB_ORDER_FPCLAMP");
+    return e != nullptr && std::strchr(e, k) != nullptr;
+}
+
+static bool BbOrderLegacy(char k) {
+    static const char* e = std::getenv("BB_ORDER_LEGACY");
+    return e != nullptr && std::strchr(e, k) != nullptr;
+}
 
 void Translator::EmitVectorAlu(const GcnInst& inst) {
     switch (inst.opcode) {
@@ -23,8 +38,16 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_SUB_F32(inst);
     case Opcode::V_SUBREV_F32:
         return V_SUBREV_F32(inst);
-    case Opcode::V_MAC_LEGACY_F32:
-        return V_MAC_F32(inst);
+    case Opcode::V_MAC_LEGACY_F32: { // bbport-order (27): legacy, 0 * x = +0 (juga NaN/inf)
+        if (!BbOrderLegacy('c')) return V_MAC_F32(inst);
+        const IR::F32 a{GetSrc<IR::F32>(inst.src[0])};
+        const IR::F32 b{GetSrc<IR::F32>(inst.src[1])};
+        const IR::F32 acc{GetSrc<IR::F32>(inst.dst[0])};
+        const IR::F32 zero{ir.Imm32(0.0f)};
+        const IR::U1 any_zero{ir.LogicalOr(ir.FPEqual(a, zero), ir.FPEqual(b, zero))};
+        SetDst(inst.dst[0], ir.FPAdd(IR::F32{ir.Select(any_zero, zero, ir.FPMul(a, b))}, acc));
+        return;
+    }
     case Opcode::V_MUL_LEGACY_F32:
         return V_MUL_LEGACY_F32(inst);
     case Opcode::V_MUL_F32:
@@ -171,22 +194,56 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_LOG_F32(inst);
     case Opcode::V_LOG_F32:
         return V_LOG_F32(inst);
-    case Opcode::V_RCP_F32:
-        return V_RCP_F32(inst);
+    case Opcode::V_RCP_F32: { // bbport-order (39): BB_ORDER_FPCLAMP 'a'
+        if (!BbOrderFpClamp('a')) {
+            return V_RCP_F32(inst);
+        }
+        const IR::F32 r{ir.FPRecip(GetSrc<IR::F32>(inst.src[0]))};
+        SetDst(inst.dst[0], ir.FPClamp(r, ir.Imm32(-3.402823466e+38f), ir.Imm32(3.402823466e+38f)));
+        return;
+    }
     case Opcode::V_RCP_LEGACY_F32:
         return V_RCP_LEGACY_F32(inst);
     case Opcode::V_RCP_F64:
         return V_RCP_F64(inst);
-    case Opcode::V_RCP_IFLAG_F32:
-        return V_RCP_F32(inst);
-    case Opcode::V_RCP_CLAMP_F32:
-        return V_RCP_F32(inst);
-    case Opcode::V_RSQ_CLAMP_F32:
-        return V_RSQ_F32(inst);
-    case Opcode::V_RSQ_LEGACY_F32:
-        return V_RSQ_F32(inst);
-    case Opcode::V_RSQ_F32:
-        return V_RSQ_F32(inst);
+    case Opcode::V_RCP_IFLAG_F32: { // bbport-order (39): BB_ORDER_FPCLAMP 'a'
+        if (!BbOrderFpClamp('a')) {
+            return V_RCP_F32(inst);
+        }
+        const IR::F32 r{ir.FPRecip(GetSrc<IR::F32>(inst.src[0]))};
+        SetDst(inst.dst[0], ir.FPClamp(r, ir.Imm32(-3.402823466e+38f), ir.Imm32(3.402823466e+38f)));
+        return;
+    }
+    case Opcode::V_RCP_CLAMP_F32: { // bbport-order (39): BB_ORDER_FPCLAMP 'c'
+        if (!BbOrderFpClamp('c')) {
+            return V_RCP_F32(inst);
+        }
+        const IR::F32 r{ir.FPRecip(GetSrc<IR::F32>(inst.src[0]))};
+        SetDst(inst.dst[0], ir.FPClamp(r, ir.Imm32(-3.402823466e+38f), ir.Imm32(3.402823466e+38f)));
+        return;
+    }
+    case Opcode::V_RSQ_CLAMP_F32: { // bbport-order (27): hasil di-clamp ke +-FLT_MAX (tanpa inf)
+        if (!BbOrderLegacy('r')) return V_RSQ_F32(inst);
+        const IR::F32 r{ir.FPRecipSqrt(GetSrc<IR::F32>(inst.src[0]))};
+        SetDst(inst.dst[0], ir.FPClamp(r, ir.Imm32(-3.402823466e+38f), ir.Imm32(3.402823466e+38f)));
+        return;
+    }
+    case Opcode::V_RSQ_LEGACY_F32: { // bbport-order (39): BB_ORDER_FPCLAMP 'l'
+        if (!BbOrderFpClamp('l')) {
+            return V_RSQ_F32(inst);
+        }
+        const IR::F32 r{ir.FPRecipSqrt(GetSrc<IR::F32>(inst.src[0]))};
+        SetDst(inst.dst[0], ir.FPClamp(r, ir.Imm32(-3.402823466e+38f), ir.Imm32(3.402823466e+38f)));
+        return;
+    }
+    case Opcode::V_RSQ_F32: { // bbport-order (39): BB_ORDER_FPCLAMP 'a'
+        if (!BbOrderFpClamp('a')) {
+            return V_RSQ_F32(inst);
+        }
+        const IR::F32 r{ir.FPRecipSqrt(GetSrc<IR::F32>(inst.src[0]))};
+        SetDst(inst.dst[0], ir.FPClamp(r, ir.Imm32(-3.402823466e+38f), ir.Imm32(3.402823466e+38f)));
+        return;
+    }
     case Opcode::V_SQRT_F32:
         return V_SQRT_F32(inst);
     case Opcode::V_SIN_F32:
@@ -413,8 +470,16 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_CMP_CLASS_F32(inst);
 
         // VOP3a
-    case Opcode::V_MAD_LEGACY_F32:
-        return V_MAD_F32(inst);
+    case Opcode::V_MAD_LEGACY_F32: { // bbport-order (27): legacy, 0 * x = +0 (juga NaN/inf)
+        if (!BbOrderLegacy('d')) return V_MAD_F32(inst);
+        const IR::F32 a{GetSrc<IR::F32>(inst.src[0])};
+        const IR::F32 b{GetSrc<IR::F32>(inst.src[1])};
+        const IR::F32 c{GetSrc<IR::F32>(inst.src[2])};
+        const IR::F32 zero{ir.Imm32(0.0f)};
+        const IR::U1 any_zero{ir.LogicalOr(ir.FPEqual(a, zero), ir.FPEqual(b, zero))};
+        SetDst(inst.dst[0], ir.FPAdd(IR::F32{ir.Select(any_zero, zero, ir.FPMul(a, b))}, c));
+        return;
+    }
     case Opcode::V_MAD_F32:
         return V_MAD_F32(inst);
     case Opcode::V_MAD_I32_I24:

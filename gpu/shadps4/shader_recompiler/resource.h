@@ -26,7 +26,7 @@ inline bool BbOrderHashListed(const char* env, u64 pgm_hash) {
     static const bool ready = [] {
         for (int k = 0; k < 2; k++) {
             const char* e = std::getenv(names[k]);
-            const char* p = e ? e : "804aeead,c75dd317,a8792bbb,8c8a4817,ad441fb1";
+            const char* p = e ? e : (k == 0 ? "804aeead,c75dd317,a8792bbb,8c8a4817,ad441fb1,539eee77" : "804aeead,c75dd317,a8792bbb,8c8a4817,ad441fb1"); // bbport-order (84)
             while (*p && lists[k].n < 32) {
                 char* end = nullptr;
                 const u64 v = std::strtoull(p, &end, 16);

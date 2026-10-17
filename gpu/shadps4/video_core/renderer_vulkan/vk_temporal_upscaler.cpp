@@ -2326,3 +2326,380 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
 }
 
 } // namespace Vulkan
+
+// bbport-order (75): The Order: 1886's TAA (compute 92311aca) replaced by DLSS / FSR 3.1.
+#include "video_core/host_shaders/order_taa_prep_comp.h"
+#include "video_core/host_shaders/order_taa_prep_sms_comp.h"
+#include "video_core/host_shaders/order_taa_prep_dms_comp.h"
+#include "video_core/host_shaders/order_taa_prep_sdms_comp.h"
+#include "video_core/host_shaders/order_taa_store_comp.h"
+
+namespace Vulkan {
+
+bool TemporalUpscaler::OrderTaa(VideoCore::ImageId scene_id, VideoCore::ImageId velocity_id,
+                                VideoCore::ImageId depth_id, VideoCore::ImageId output_id,
+                                float velocity_scale) {
+    if (order_mode < 0) {
+        order_mode = 0;
+        const char* hook = std::getenv("BB_ORDER_TAA_HOOK");
+        if (hook && std::strcmp(hook, "dlss") == 0) {
+            order_mode = 2;
+        } else if (hook && std::strcmp(hook, "fsr3") == 0) {
+            order_mode = 1;
+        }
+        if (order_mode == 2) {
+            const Dlss* dlss = Dlss::Get();
+            if (!dlss || !dlss->Available()) {
+                std::printf("bbport-order (75): DLSS tidak tersedia (%s): FSR 3.1 dipakai\n",
+                            dlss ? dlss->Problem().c_str() : "bridge atau library NVIDIA tidak ada");
+                order_mode = 1;
+            }
+        }
+        if (const char* mv = std::getenv("BB_ORDER_TAA_MV")) {
+            order_mv = std::strtof(mv, nullptr);
+        }
+        if (order_mode != 0) {
+            std::printf("bbport-order (75): TAA game diganti %s (faktor motion vector %.2f)\n",
+                        order_mode == 2 ? "DLSS (DLAA)" : "FSR 3.1 (Native AA)", order_mv);
+        }
+        std::fflush(stdout);
+    }
+    if (order_mode == 0 || order_failed) {
+        return false;
+    }
+    if (!scene_id || !velocity_id || !depth_id || !output_id) {
+        return false;
+    }
+    auto& scene = texture_cache.GetImage(scene_id);
+    auto& velocity = texture_cache.GetImage(velocity_id);
+    auto& depth = texture_cache.GetImage(depth_id);
+    auto& output = texture_cache.GetImage(output_id);
+    const u32 w = output.info.size.width, h = output.info.size.height;
+    const auto fail = [&](const char* why) {
+        if (!order_warned) {
+            order_warned = true;
+            std::printf("bbport-order (75): TAA game tetap dipakai: %s (output %ux%u)\n", why, w, h);
+            std::fflush(stdout);
+        }
+        return false;
+    };
+    const bool depth_stencil = depth.info.pixel_format == vk::Format::eD32SfloatS8Uint;
+    if (output.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+        !(output.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        return fail("output bukan RGBA16F storage");
+    }
+    if (scene.info.pixel_format != vk::Format::eR16G16B16A16Sfloat) {
+        return fail("warna adegan bukan RGBA16F");
+    }
+    if (velocity.info.pixel_format != vk::Format::eA2B10G10R10UnormPack32) {
+        return fail("motion vector bukan A2B10G10R10");
+    }
+    if (depth.info.pixel_format != vk::Format::eD32Sfloat && !depth_stencil) {
+        return fail("format depth");
+    }
+    if (scene.info.size.width != w || scene.info.size.height != h ||
+        velocity.info.size.width != w || velocity.info.size.height != h ||
+        depth.info.size.width != w || depth.info.size.height != h) {
+        return fail("ukuran input tidak sama");
+    }
+    if (!scene.backing || !velocity.backing || !depth.backing || velocity.backing->num_samples != 1) {
+        return fail("sampel motion vector");
+    }
+    if (velocity_scale != order_last_scale) {
+        order_last_scale = velocity_scale;
+        std::printf("bbport-order (75): skala motion vector game %.4f\n", velocity_scale);
+        std::fflush(stdout);
+    }
+    if (order_mode == 2 && dlss_failed) {
+        order_mode = 1;
+    }
+    if (!EnsureResources(w, h, w, h, true)) {
+        order_failed = true;
+        return fail("resource upscaler");
+    }
+    const auto device = instance.GetDevice();
+    if (order_w != w || order_h != h || !order_color_image) {
+        scheduler.Finish();
+        const auto allocator = instance.GetAllocator();
+        const auto make = [&](VideoCore::UniqueImage& image, vk::UniqueImageView& view,
+                              vk::Format format) {
+            view.reset();
+            image = VideoCore::UniqueImage(device, allocator);
+            image.Create(vk::ImageCreateInfo{
+                .imageType = vk::ImageType::e2D,
+                .format = format,
+                .extent = {w, h, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+                .initialLayout = vk::ImageLayout::eUndefined,
+            });
+            view = Check(device.createImageViewUnique({
+                .image = vk::Image(image),
+                .viewType = vk::ImageViewType::e2D,
+                .format = format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            }));
+        };
+        make(order_color_image, order_color_view, vk::Format::eR16G16B16A16Sfloat);
+        make(order_depth_image, order_depth_view, vk::Format::eR32Sfloat);
+        order_w = w;
+        order_h = h;
+        order_reset = true;
+        std::printf("bbport-order (75): input %ux%u (sampel warna %u, depth %u)\n", w, h,
+                    scene.backing->num_samples, depth.backing->num_samples);
+        std::fflush(stdout);
+    }
+    if (!order_store_pipeline) {
+        const auto compute = [&](const auto& code, vk::PipelineLayout layout) {
+            const auto module = CompileSPV(code, device);
+            auto pipeline = Check(device.createComputePipelineUnique(
+                {}, vk::ComputePipelineCreateInfo{
+                        .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                  .module = module,
+                                  .pName = "main"},
+                        .layout = layout,
+                    }));
+            device.destroyShaderModule(module);
+            return pipeline;
+        };
+        std::array<vk::DescriptorSetLayoutBinding, 6> prep{};
+        for (u32 i = 0; i < prep.size(); ++i) {
+            prep[i] = {.binding = i,
+                       .descriptorType = i < 3 ? vk::DescriptorType::eSampledImage
+                                               : vk::DescriptorType::eStorageImage,
+                       .descriptorCount = 1,
+                       .stageFlags = vk::ShaderStageFlagBits::eCompute};
+        }
+        order_prep_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = u32(prep.size()),
+            .pBindings = prep.data(),
+        }));
+        const vk::PushConstantRange prep_push{vk::ShaderStageFlagBits::eCompute, 0, 16};
+        order_prep_pipeline_layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*order_prep_desc_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &prep_push,
+        }));
+        std::array<vk::DescriptorSetLayoutBinding, 2> store{};
+        for (u32 i = 0; i < store.size(); ++i) {
+            store[i] = {.binding = i,
+                        .descriptorType = vk::DescriptorType::eStorageImage,
+                        .descriptorCount = 1,
+                        .stageFlags = vk::ShaderStageFlagBits::eCompute};
+        }
+        order_store_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = u32(store.size()),
+            .pBindings = store.data(),
+        }));
+        order_store_pipeline_layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*order_store_desc_layout,
+        }));
+        order_prep_pipelines[0] = compute(ORDER_TAA_PREP_COMP, *order_prep_pipeline_layout);
+        order_prep_pipelines[1] = compute(ORDER_TAA_PREP_SMS_COMP, *order_prep_pipeline_layout);
+        order_prep_pipelines[2] = compute(ORDER_TAA_PREP_DMS_COMP, *order_prep_pipeline_layout);
+        order_prep_pipelines[3] = compute(ORDER_TAA_PREP_SDMS_COMP, *order_prep_pipeline_layout);
+        order_store_pipeline = compute(ORDER_TAA_STORE_COMP, *order_store_pipeline_layout);
+    }
+
+    const auto depth_format = depth.info.pixel_format;
+    const auto scene_view =
+        CachedView(scene, vk::Format::eR16G16B16A16Sfloat, vk::ImageAspectFlagBits::eColor);
+    const auto depth_view = CachedView(depth, depth_format, vk::ImageAspectFlagBits::eDepth);
+    const auto velocity_view =
+        CachedView(velocity, vk::Format::eA2B10G10R10UnormPack32, vk::ImageAspectFlagBits::eColor);
+    const auto output_guest_view =
+        CachedView(output, vk::Format::eR16G16B16A16Sfloat, vk::ImageAspectFlagBits::eColor);
+
+    scheduler.EndRendering();
+    const auto read = vk::AccessFlagBits2::eShaderRead;
+    const auto cs_stage = vk::PipelineStageFlagBits2::eComputeShader;
+    runtime.Transit(&scene, vk::ImageLayout::eGeneral, cs_stage, read);
+    runtime.Transit(&velocity, vk::ImageLayout::eGeneral, cs_stage, read);
+    runtime.Transit(&depth, vk::ImageLayout::eGeneral, cs_stage, read);
+    runtime.Transit(&output, vk::ImageLayout::eGeneral, cs_stage,
+                    vk::AccessFlagBits2::eShaderWrite);
+    runtime.FlushBarriers();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const Breadcrumbs::Scope crumb{cmdbuf, scheduler.CrumbStream(), "Order TAA hook"};
+    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+    const auto barrier = [&](vk::Image image, vk::ImageLayout old_layout, vk::AccessFlags2 src,
+                             vk::AccessFlags2 dst) {
+        const vk::ImageMemoryBarrier2 b{
+            .srcStageMask = all,
+            .srcAccessMask = src,
+            .dstStageMask = all,
+            .dstAccessMask = dst,
+            .oldLayout = old_layout,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+    };
+    const auto none = vk::AccessFlagBits2::eNone;
+    barrier(vk::Image(order_color_image), vk::ImageLayout::eUndefined, none, rw);
+    barrier(vk::Image(order_depth_image), vk::ImageLayout::eUndefined, none, rw);
+    barrier(vk::Image(motion_image), vk::ImageLayout::eUndefined, none, rw);
+    barrier(vk::Image(output_image), vk::ImageLayout::eUndefined, none, rw);
+
+    {
+        const vk::DescriptorImageInfo infos[6] = {
+            {.imageView = scene_view, .imageLayout = vk::ImageLayout::eGeneral},
+            {.imageView = depth_view, .imageLayout = vk::ImageLayout::eGeneral},
+            {.imageView = velocity_view, .imageLayout = vk::ImageLayout::eGeneral},
+            {.imageView = *order_color_view, .imageLayout = vk::ImageLayout::eGeneral},
+            {.imageView = *order_depth_view, .imageLayout = vk::ImageLayout::eGeneral},
+            {.imageView = *motion_view, .imageLayout = vk::ImageLayout::eGeneral},
+        };
+        std::array<vk::WriteDescriptorSet, 6> writes{};
+        for (u32 i = 0; i < writes.size(); ++i) {
+            writes[i] = {.dstBinding = i,
+                         .descriptorCount = 1,
+                         .descriptorType = i < 3 ? vk::DescriptorType::eSampledImage
+                                                 : vk::DescriptorType::eStorageImage,
+                         .pImageInfo = &infos[i]};
+        }
+        const u32 variant = (scene.backing->num_samples > 1 ? 1u : 0u) |
+                            (depth.backing->num_samples > 1 ? 2u : 0u);
+        struct {
+            float scale;
+            u32 width, height, pad;
+        } push{velocity_scale * order_mv, w, h, 0};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *order_prep_pipelines[variant]);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *order_prep_pipeline_layout,
+                                    0, writes);
+        cmdbuf.pushConstants(*order_prep_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             sizeof(push), &push);
+        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    }
+    barrier(vk::Image(order_color_image), vk::ImageLayout::eGeneral, rw, rw);
+    barrier(vk::Image(order_depth_image), vk::ImageLayout::eGeneral, rw, rw);
+    barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral, rw, rw);
+
+    const auto now = std::chrono::steady_clock::now();
+    float frame_ms = std::chrono::duration<float, std::milli>(now - order_last_frame).count();
+    if (frame_ms <= 0.0f || frame_ms > 200.0f) {
+        frame_ms = 16.6f;
+    }
+    order_last_frame = now;
+
+    bool ok = false;
+    if (order_mode == 2) {
+        Dlss* dlss = Dlss::Get();
+        const Dlss::FeatureDesc desc{w, h, w, h, 0, true};
+        ok = true;
+        if (!dlss->HasFeature(desc)) {
+            scheduler.WaitSubmittedWork();
+            dlss->ReleaseFeature();
+            ok = dlss->CreateFeature(cmdbuf, desc);
+            order_reset = true;
+        }
+        if (ok) {
+            ok = dlss->Evaluate(cmdbuf, {
+                .color = {vk::Image(order_color_image), *order_color_view,
+                          vk::Format::eR16G16B16A16Sfloat, vk::ImageAspectFlagBits::eColor, w, h},
+                .depth = {vk::Image(order_depth_image), *order_depth_view, vk::Format::eR32Sfloat,
+                          vk::ImageAspectFlagBits::eColor, w, h},
+                .motion = {vk::Image(motion_image), *motion_view, vk::Format::eR16G16Sfloat,
+                           vk::ImageAspectFlagBits::eColor, w, h},
+                .output = {vk::Image(output_image), *output_view, vk::Format::eR16G16B16A16Sfloat,
+                           vk::ImageAspectFlagBits::eColor, w, h},
+                .jitter_x = 0.0f,
+                .jitter_y = 0.0f,
+                .reset = order_reset,
+                .frame_ms = frame_ms,
+                .sharpness = 0.0f,
+            });
+        }
+        if (!ok) {
+            std::printf("bbport-order (75): DLSS gagal; FSR 3.1 dipakai mulai frame berikutnya\n");
+            std::fflush(stdout);
+            order_mode = 1;
+            order_reset = true;
+        }
+    } else if (context) {
+        FfxVkPortableUpscaleDispatchInfo info{};
+        info.structSize = sizeof(info);
+        info.commandBuffer = cmdbuf;
+        const auto rw_usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+        info.color = Describe(vk::Image(order_color_image), vk::Format::eR16G16B16A16Sfloat, w, h,
+                              rw_usage, vk::ImageAspectFlagBits::eColor,
+                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.depth = Describe(vk::Image(order_depth_image), vk::Format::eR32Sfloat, w, h, rw_usage,
+                              vk::ImageAspectFlagBits::eColor,
+                              FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.motionVectors = Describe(vk::Image(motion_image), vk::Format::eR16G16Sfloat, w, h,
+                                      rw_usage, vk::ImageAspectFlagBits::eColor,
+                                      FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
+        info.output = Describe(vk::Image(output_image), vk::Format::eR16G16B16A16Sfloat, w, h,
+                               rw_usage | vk::ImageUsageFlagBits::eTransferSrc,
+                               vk::ImageAspectFlagBits::eColor,
+                               FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS);
+        info.exposure.structSize = sizeof(info.exposure);
+        info.reactiveMask.structSize = sizeof(info.reactiveMask);
+        info.transparencyAndCompositionMask.structSize = sizeof(info.transparencyAndCompositionMask);
+        info.jitterOffset = {0.0f, 0.0f};
+        info.motionVectorScale = {1.0f, 1.0f};
+        info.renderSize = {w, h};
+        info.outputSize = {w, h};
+        info.frameTimeMilliseconds = frame_ms;
+        info.preExposure = 1.0f;
+        info.cameraNear = 0.1f;
+        info.cameraFar = 10000.0f;
+        info.cameraVerticalFovRadians = 0.9f;
+        info.viewSpaceToMeters = 1.0f;
+        info.sharpness = 0.0f;
+        info.enableSharpening = VK_FALSE;
+        info.reset = order_reset ? VK_TRUE : VK_FALSE;
+        info.frameId = frame_id++;
+        FfxVkPortableUpscaleCreateInfo create_info{};
+        create_info.structSize = sizeof(create_info);
+        create_info.flags =
+            FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT | FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE;
+        create_info.maxRenderSize = {w, h};
+        create_info.maxOutputSize = {w, h};
+        if (const u64 issues = ffxVkPortableValidateUpscaleDispatchInfo(&create_info, &info)) {
+            PrintIssues("Order TAA dispatch", issues);
+        } else if (ffxVkPortableUpscaleContextRecordDispatch(context, &info) == FFX_VK_PORTABLE_OK) {
+            ok = true;
+        }
+        if (!ok) {
+            std::printf("bbport-order (75): FSR 3.1 gagal; TAA game dipakai lagi\n");
+            std::fflush(stdout);
+            order_failed = true;
+        }
+    }
+    if (!ok) {
+        return false;
+    }
+    order_reset = false;
+    barrier(vk::Image(output_image), vk::ImageLayout::eGeneral, rw, rw);
+    {
+        const vk::DescriptorImageInfo src{.imageView = *output_view,
+                                          .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo dst{.imageView = output_guest_view,
+                                          .imageLayout = vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 2> writes = {{
+            {.dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &src},
+            {.dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &dst},
+        }};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *order_store_pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *order_store_pipeline_layout,
+                                    0, writes);
+        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    }
+    return true;
+}
+
+} // namespace Vulkan

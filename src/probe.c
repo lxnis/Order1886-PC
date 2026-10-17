@@ -166,7 +166,9 @@ static void fault(int sig, siginfo_t *info, void *context) {
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
     /* bbport-dmc: register dump for guest faults; values inside the image also as guest offsets. */
-    if (rip - (uintptr_t)image < 0x10000000) {
+    Dl_info bb_rip_where; /* bbport-order (96): juga untuk kode generate (bukan image, bukan .so) */
+    if (rip - (uintptr_t)image < 0x10000000 ||
+        !(dladdr((void *)rip, &bb_rip_where) && bb_rip_where.dli_fname)) {
         static const struct { const char *name; int reg; } regs[] = {
             {"rax",REG_RAX},{"rbx",REG_RBX},{"rcx",REG_RCX},{"rdx",REG_RDX},{"rsi",REG_RSI},
             {"rdi",REG_RDI},{"rbp",REG_RBP},{"rsp",REG_RSP},{"r8",REG_R8},{"r9",REG_R9},
@@ -187,11 +189,16 @@ static void fault(int sig, siginfo_t *info, void *context) {
         }
         /* bbport-dmc: the top of the stack (return addresses of the callers). */
         const uintptr_t *sp = (const uintptr_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
-        for (int i = 0; i < 24; i++) {
+        for (int i = 0; i < 48; i++) { /* bbport-order (96): 48 entri + nama library */
             const uintptr_t v = sp[i];
+            Dl_info bb_sw;
             if (v - (uintptr_t)image < 0x10000000)
                 snprintf(line, sizeof(line), "  [rsp+0x%02x] = 0x%016lx  (guest offset 0x%lx)\n", i * 8,
                          (unsigned long)v, (unsigned long)(v - (uintptr_t)image));
+            else if (v > 0x10000 && dladdr((void *)v, &bb_sw) && bb_sw.dli_fname)
+                snprintf(line, sizeof(line), "  [rsp+0x%02x] = 0x%016lx  %s+0x%lx (%s)\n", i * 8, (unsigned long)v,
+                         bb_sw.dli_fname, (unsigned long)(v - (uintptr_t)bb_sw.dli_fbase),
+                         bb_sw.dli_sname ? bb_sw.dli_sname : "?");
             else
                 snprintf(line, sizeof(line), "  [rsp+0x%02x] = 0x%016lx\n", i * 8, (unsigned long)v);
             { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
