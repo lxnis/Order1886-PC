@@ -296,7 +296,7 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
                 LOG_ERROR(Render_Recompiler, "image is not MS but ms operand is provided");
             }
             operands.Add(spv::ImageOperandsMask::Lod, lod);
-            operands.Add(spv::ImageOperandsMask::Sample, ms);
+            // bbport-order (49): image non-multisample tidak boleh diberi operand Sample
         }
         texel = ctx.OpImageFetch(color_type, image, coords, operands.mask, operands.operands);
     } else {

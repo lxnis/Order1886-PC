@@ -1,3 +1,9 @@
+#include <cstdlib>
+#include <cstdio>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -100,6 +106,47 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
+// bbport-order (52): dari diagnosa port GoW3 (DiagDumpImage, GPL-2.0-or-later).
+void TextureCache::BbOrderDumpImage(ImageId image_id, const char* tag) {
+    Image& image = slot_images[image_id];
+    const u32 bytes_per_pixel = image.info.num_bits / 8;
+    // bbport-order (69): depth 4 byte/piksel (D32) ikut ditulis, aspek depth.
+    const bool bb_depth = image.info.props.is_depth;
+    if ((bb_depth && bytes_per_pixel != 4) || image.info.props.is_block || bytes_per_pixel == 0 ||
+        image.info.num_samples > 1) {
+        return;
+    }
+    const u32 size = image.info.pitch * image.info.size.height * bytes_per_pixel;
+    const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
+    const vk::BufferImageCopy copy = {
+        .bufferOffset = download.offset,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource = {bb_depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, 1},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+    scheduler.Finish();
+    download.Invalidate();
+    static int sequence = 0;
+    const char* dir = std::getenv("BB_ORDER_DIAG_DIR");
+    const char* dir_path = dir && *dir ? dir : ".";
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/%03d_%s_%llx_%ux%u_p%u_b%u_f%d.raw", dir_path, sequence++,
+                  tag, static_cast<unsigned long long>(image.info.guest_address),
+                  image.info.size.width, image.info.size.height, image.info.pitch, bytes_per_pixel,
+                  static_cast<int>(image.info.pixel_format));
+    if (FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(download.mapped, 1, size, f);
+        std::fclose(f);
+        std::printf("bbport-order (52): dump %s\n", path);
+    } else {
+        std::printf("bbport-order (52): gagal menulis %s\n", path);
+    }
+    std::fflush(stdout);
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
@@ -199,6 +246,27 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         if (image.Overlaps(addr, size)) {
+            { // bbport-order (31): tulisan CPU di dalam render target layar (BB_ORDER_RT_IGNORE_CPU=1)
+                static const bool ignore_cpu = [] {
+                    const char* e = std::getenv("BB_ORDER_RT_IGNORE_CPU");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (ignore_cpu && True(image.flags & ImageFlagBits::GpuModified) &&
+                    (u32(image.info.tile_mode) == 14 || image.info.props.is_depth) && /* bbport-order (33) */ image.info.size.width >= 256 && /* bbport-order (34) */
+                    image.info.size.height >= 256) {
+                    static std::atomic<u32> told31{0};
+                    if (told31.fetch_add(1) < 32) {
+                        std::printf("bbport-order (31): tulisan CPU %#llx+%#zx di target %#llx %ux%u "
+                                    "fmt %u diabaikan\n",
+                                    (unsigned long long)addr, size,
+                                    (unsigned long long)image.info.guest_address,
+                                    image.info.size.width, image.info.size.height,
+                                    u32(image.info.pixel_format));
+                    }
+                    UntrackImage(image_id);
+                    return;
+                }
+            }
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
@@ -262,10 +330,63 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         if (image.info.guest_address != address) {
             return;
         }
+        { // bbport-order (32): render target layar kebal tulisan buffer GPU (BB_ORDER_RT_IGNORE_GPUBUF=1)
+            static const bool ignore_gpubuf = [] {
+                const char* e = std::getenv("BB_ORDER_RT_IGNORE_GPUBUF");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (ignore_gpubuf && True(image.flags & ImageFlagBits::GpuModified) &&
+                (u32(image.info.tile_mode) == 14 || image.info.props.is_depth) && /* bbport-order (33) */ image.info.size.width >= 256 && /* bbport-order (34) */
+                image.info.size.height >= 256) {
+                static std::atomic<u32> told32{0};
+                if (told32.fetch_add(1) < 32) {
+                    std::printf("bbport-order (32): tulisan buffer GPU %#llx di target %ux%u fmt %u "
+                                "diabaikan\n",
+                                (unsigned long long)address, image.info.size.width,
+                                image.info.size.height, u32(image.info.pixel_format));
+                }
+                return;
+            }
+        }
         // Ensure image is reuploaded when accessed again.
         WatchImage(image, "GPU write (marked for refresh)");
         image.flags |= ImageFlagBits::GpuDirty;
     });
+    { // bbport-order (79): texture yang mulai DI DALAM rentang tulisan GPU juga disegarkan
+        static const u64 span = [] {
+            const char* e = std::getenv("BB_ORDER_GPUWRITE_SPAN");
+            return u64(e ? std::strtoull(e, nullptr, 10) : 0) << 20; // bbport-order (81): bawaan mati
+        }();
+        static const bool log79 = [] {
+            const char* e = std::getenv("BB_ORDER_GPUWRITE_LOG");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (span != 0 && max_size > 1 && max_size <= span) {
+            ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
+                if (image.info.guest_address <= address ||
+                    image.info.guest_address >= address + max_size) {
+                    return;
+                }
+                if (image.usage.render_target || image.usage.depth_target || image.usage.storage ||
+                    image.info.props.is_depth || True(image.flags & ImageFlagBits::GpuDirty)) {
+                    return;
+                }
+                if (log79) {
+                    static std::atomic<u32> told79{0};
+                    if (told79.fetch_add(1) < 40) {
+                        std::printf("bbport-order (79): tulisan GPU %#llx+%#llx menyegarkan texture "
+                                    "%#llx %ux%u fmt %u\n",
+                                    (unsigned long long)address, (unsigned long long)max_size,
+                                    (unsigned long long)image.info.guest_address,
+                                    image.info.size.width, image.info.size.height,
+                                    u32(image.info.pixel_format));
+                    }
+                }
+                WatchImage(image, "GPU write inside (79, marked for refresh)");
+                image.flags |= ImageFlagBits::GpuDirty;
+            });
+        }
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -604,6 +725,47 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+// bbport-order (41): BB_ORDER_ALIAS_LOG=1 -> image baru di atas image hasil GPU dicatat.
+struct BbOrderGpuOverlap {
+    VAddr addr;
+    u64 size;
+    u32 w, h, tile, bits, levels, layers;
+    vk::Format fmt;
+};
+static bool BbOrderAliasLogOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_ALIAS_LOG");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+static void BbOrderAliasReport(const ImageInfo& info, u32 binding,
+                               const std::vector<BbOrderGpuOverlap>& overlaps) {
+    static std::mutex m;
+    static std::unordered_set<u64> seen;
+    const u64 key = info.guest_address ^ (u64(info.pixel_format) << 44) ^ (u64(binding) << 60) ^
+                    (overlaps[0].addr << 7);
+    {
+        std::scoped_lock lock{m};
+        if (seen.size() >= 400 || !seen.insert(key).second) {
+            return;
+        }
+    }
+    std::printf("bbport-order (41): image baru bind %u %#llx %ux%u mip %u layer %u fmt %s tile %u "
+                "bits %u size %#llx menimpa %zu image GPU:\n",
+                binding, (unsigned long long)info.guest_address, info.size.width, info.size.height,
+                info.resources.levels, info.resources.layers,
+                vk::to_string(info.pixel_format).c_str(), u32(info.tile_mode), info.num_bits,
+                (unsigned long long)info.guest_size, overlaps.size());
+    for (const auto& o : overlaps) {
+        std::printf("    gpu %#llx (%+lld) %ux%u mip %u layer %u fmt %s tile %u bits %u size %#llx\n",
+                    (unsigned long long)o.addr, (long long)(o.addr - info.guest_address), o.w, o.h,
+                    o.levels, o.layers, vk::to_string(o.fmt).c_str(), o.tile, o.bits,
+                    (unsigned long long)o.size);
+    }
+    std::fflush(stdout);
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
@@ -651,6 +813,20 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+
+    std::vector<BbOrderGpuOverlap> bb_gpu_overlaps; // bbport-order (41)
+    if (BbOrderAliasLogOn()) {
+        for (const auto& id : image_ids) {
+            const auto& ci = slot_images[id];
+            if (True(ci.flags & ImageFlagBits::GpuModified)) {
+                bb_gpu_overlaps.push_back({ci.info.guest_address, ci.info.guest_size,
+                                           ci.info.size.width, ci.info.size.height,
+                                           u32(ci.info.tile_mode), ci.info.num_bits,
+                                           ci.info.resources.levels, ci.info.resources.layers,
+                                           ci.info.pixel_format});
+            }
+        }
+    }
 
     ImageId image_id{};
 
@@ -709,6 +885,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        if (!bb_gpu_overlaps.empty()) { // bbport-order (41)
+            BbOrderAliasReport(info, u32(desc.type), bb_gpu_overlaps);
+        }
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -881,6 +1060,24 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    { // bbport-order (30): render target baru tidak diisi dari memori lama (BB_ORDER_RT_NOREFRESH=1)
+        static const bool no_refresh = [] {
+            const char* e = std::getenv("BB_ORDER_RT_NOREFRESH");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (no_refresh && False(image.flags & ImageFlagBits::GpuModified) &&
+            u32(image.info.tile_mode) == 14 && image.info.size.width >= 1280 &&
+            image.info.size.height >= 720) {
+            static std::atomic<u32> told30{0};
+            if (told30.fetch_add(1) < 32) {
+                std::printf("bbport-order (30): unggahan dilewati %#llx %ux%u fmt %u flags %#x\n",
+                            (unsigned long long)image.info.guest_address, image.info.size.width,
+                            image.info.size.height, u32(image.info.pixel_format), u32(image.flags));
+            }
+            image.flags &= ~ImageFlagBits::Dirty;
+            return;
+        }
+    }
     BbStats::Timer timer{BbStats::t_refresh};
 
     RENDERER_TRACE;
@@ -1034,6 +1231,19 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
+    if (image.info.guest_size > (256u << 20)) { // bbport-order: asal image raksasa (freeze)
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "bbport-order: image raksasa {} MB di {:#x}: {}x{}x{} pitch {} layer {} mip {} "
+                        "sampel {} format {} tipe {} tile {} depth {}",
+                        image.info.guest_size >> 20, image.info.guest_address, image.info.size.width,
+                        image.info.size.height, image.info.size.depth, image.info.pitch,
+                        image.info.resources.layers, image.info.resources.levels,
+                        image.info.num_samples, vk::to_string(image.info.pixel_format),
+                        u32(image.info.type), u32(image.info.tile_mode), u32(image.info.props.is_depth));
+        }
+    }
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     BbStats::live_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024),
                                         std::memory_order_relaxed);

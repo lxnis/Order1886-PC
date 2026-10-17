@@ -126,7 +126,12 @@ GraphicsPipeline::GraphicsPipeline(
                 key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
             .sampleShadingEnable =
                 fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
+            .alphaToCoverageEnable = key.alpha_to_coverage != 0, // bbport-order (43)
         };
+        if (key.alpha_to_coverage != 0) {
+            LOG_WARNING(Render_Vulkan, "bbport-order (43): alpha-to-coverage {} samples {}",
+                        debug_str, u32(key.num_samples));
+        }
     }
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
@@ -349,7 +350,29 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     /* No host unwinder: guest frames have no registered FDEs. */
     exit_longjmp(t);
 }
-static ABI int32_t thread_yield(void) { sched_yield(); return 0; }
+static ABI int32_t thread_yield(void) { /* bbport-order (74) */
+    static int sleep_us = -1;
+    if (sleep_us < 0) {
+        const char *e = getenv("BB_ORDER_YIELD_US");
+        sleep_us = e ? atoi(e) : 0;
+        if (sleep_us > 0) {
+            fprintf(stderr, "bbport-order (74): Task Kernel yield -> tidur %d us\n", sleep_us);
+        }
+    }
+    static __thread int task_kernel = -1;
+    if (task_kernel < 0) {
+        char name[32] = {0};
+        pthread_getname_np(pthread_self(), name, sizeof name);
+        task_kernel = strncmp(name, "Task Kernel", 11) == 0;
+    }
+    if (sleep_us > 0 && task_kernel) {
+        struct timespec ts = {0, (long)sleep_us * 1000L};
+        nanosleep(&ts, NULL);
+    } else {
+        sched_yield();
+    }
+    return 0;
+}
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
     if (!find_thread(t)) return ERR(3);
     if (!prio) return ERR(22);

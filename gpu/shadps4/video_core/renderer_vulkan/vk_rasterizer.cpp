@@ -1,3 +1,5 @@
+#include <unordered_map>
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -6,6 +8,60 @@
 #endif
 #include <map>
 #include <unordered_set>
+#include <chrono>
+#include <cstdio>
+#include <mutex>
+#include <vector>
+
+// bbport-order (66): BB_ORDER_FULLBARRIER=1 -> barrier memori penuh sebelum tiap draw.
+static bool BbOrderFullBarrier() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_FULLBARRIER");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// bbport-order (44): BB_ORDER_SKIP_FILE = daftar hash shader (hex) yang tidak dijalankan.
+static bool BbOrderSkipLive(unsigned long long hash) {
+    static const char* path = std::getenv("BB_ORDER_SKIP_FILE");
+    if (path == nullptr || hash == 0) {
+        return false;
+    }
+    static std::mutex m;
+    static std::vector<unsigned long long> list;
+    static long long next = 0;
+    std::scoped_lock lock{m};
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    if (now >= next) {
+        next = now + 500;
+        std::vector<unsigned long long> fresh;
+        if (FILE* f = std::fopen(path, "r")) {
+            unsigned long long h = 0;
+            while (std::fscanf(f, " %llx%*[ ,\n\t]", &h) == 1) {
+                fresh.push_back(h);
+            }
+            std::fclose(f);
+        }
+        if (fresh != list) {
+            list = fresh;
+            std::printf("bbport-order (44): skip %zu shader:", list.size());
+            for (const auto x : list) {
+                std::printf(" %llx", x);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    }
+    for (const auto x : list) {
+        if (x == hash) {
+            return true;
+        }
+    }
+    return false;
+}
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_timeline.h"
@@ -42,6 +98,10 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+// bbport-order (75): depth of The Order's G-buffer pass (3 color targets, color0 = the
+// A2B10G10R10 motion vectors): the scene depth for DLSS / FSR 3.1 in place of the game's TAA.
+static VideoCore::ImageId bb_order_scene_depth{};
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -394,6 +454,36 @@ inline AmdGpu::CbDbExtent Rasterizer::DbExtent() const {
 }
 
 namespace {
+/// bbport-order: tile mode 27..30 tidak ada di GPU PS4; T# seperti itu berisi sampah
+/// (The Order: "Unknown tile mode = 29" di GetArrayMode). LinearGeneral (31) juga ditolak untuk
+/// texture: ImageInfo::UpdateSize tidak bisa mengukurnya ("Unhandled array mode"), dan di The Order
+/// yang memakainya hanya T# sampah (5_9_9_9 + UbnormNz).
+bool IsKnownTileMode(AmdGpu::TileMode mode) {
+    return static_cast<u32>(mode) <= static_cast<u32>(AmdGpu::TileMode::Thick3DXThick);
+}
+/// bbport-order: T# sampah bisa berukuran raksasa (lebar/tinggi 16384, ribuan layer) sehingga
+/// vmaCreateImage gagal dengan ErrorOutOfDeviceMemory. Texture asli PS4 jauh di bawah 1 GiB.
+bool IsPlausibleImageSize(const AmdGpu::Image& t) {
+    const u32 fmt = static_cast<u32>(t.GetDataFmt());
+    const u64 bits = fmt <= 56 ? AmdGpu::NumBitsPerElement(t.GetDataFmt()) : 32;
+    const u64 slices = t.GetType() == AmdGpu::ImageType::Color3D ? u64(t.depth) + 1 : t.NumLayers();
+    const u64 bytes = (u64(t.width) + 1) * (u64(t.height) + 1) * slices * (bits ? bits : 32) / 8;
+    // bbport-order: memori guest PS4 jauh di atas 256 MiB; T# di 0x1000 dsb. adalah sampah
+    // (The Order: image 530 MB di 0x1000 -> GetBarriers assertion).
+    // bbport-order (21): 256 MiB = texture 8192x8192 RGBA8; 1 GiB meloloskan T# sampah 16384x16384
+    // yang dengan mip menjadi +-1,6 GB (freeze: "1 images registered, 1635 MB image uploads").
+    // bbport-order (25): perkiraan memakai pitch dan padding tile; T# sampah 60x25 pitch 10945,
+    // 3953 layer (1,2 GB di texture cache) membuat game freeze.
+    const u64 row = std::max<u64>(u64(t.width) + 1, t.Pitch());
+    const u64 padded = ((row + 63) & ~u64(63)) * ((u64(t.height) + 8) & ~u64(7)) * slices *
+                       (bits ? bits : 32) / 8;
+    return bytes <= (u64(1) << 28) && padded <= (u64(1) << 29) && t.Address() >= (u64(1) << 28);
+}
+/// bbport-order: V# lebih dari 256 MiB (BB_ORDER_BIG_BUFFER=1: pengaman mati).
+bool BbOrderRejectBigBuffer(u64 size) {
+    static const bool allow_big = std::getenv("BB_ORDER_BIG_BUFFER") != nullptr;
+    return !allow_big && size > (u64(256) << 20);
+}
 /// magic_enum::enum_contains, from a table: it scans every enumerator (per texture per draw).
 bool IsKnownFormat(AmdGpu::DataFormat data_fmt, AmdGpu::NumberFormat num_fmt) {
     static const auto tables = [] {
@@ -582,6 +672,13 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image.binding.is_target = 1u;
     } else {
         db_desc.first = {};
+    }
+    if (std::popcount(key.mrt_mask) == 3 && db_desc.first && cb_descs[0].first &&
+        regs.depth_control.depth_write_enable) { // bbport-order (75)
+        const auto& bb_c0 = texture_cache.GetImage(cb_descs[0].first);
+        if (bb_c0.info.pixel_format == vk::Format::eA2B10G10R10UnormPack32) {
+            bb_order_scene_depth = db_desc.first;
+        }
     }
     // bbport: the G-buffer pass (5+ color targets) holds the scene depth, and its constants the
     // main camera (shadow passes bind the same layout with the light's camera).
@@ -894,6 +991,34 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::Flatbuf &&
                 !stage.flattened_ud_buf.empty()) {
+                // bbport-order (63): BB_ORDER_FLATLOG=1 -> flatbuf shader wajah dicatat saat capture
+                static const bool bb_flat_log = [] {
+                    const char* e = std::getenv("BB_ORDER_FLATLOG");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (bb_flat_log && FrameCapture::Active() &&
+                    stage.sw_stage == Shader::SwStage::Vertex) {
+                    static const u64 bb_hs[] = {0x1077f760, 0x70b542d,  0xe0ec7fe0, 0x429d950d,
+                                                0xb938dd39, 0xbd739cf5, 0xb2cc4b8f, 0xa369ab85,
+                                                0x59c67371, 0xfd7e121b, 0x231d370b, 0x190852fd,
+                                                0xb68b212f};
+                    bool bb_hit = false;
+                    for (const u64 h : bb_hs) {
+                        bb_hit |= h == stage.pgm_hash;
+                    }
+                    if (bb_hit) {
+                        const auto& fb = stage.flattened_ud_buf;
+                        char note[256];
+                        for (size_t i = 0; i < fb.size(); i += 16) {
+                            int n = std::snprintf(note, sizeof(note), "\n  flat vs %08x [%3u]",
+                                                  u32(stage.pgm_hash), u32(i));
+                            for (size_t j = i; j < fb.size() && j < i + 16; ++j) {
+                                n += std::snprintf(note + n, sizeof(note) - n, " %08x", u32(fb[j]));
+                            }
+                            FrameCapture::Note(note);
+                        }
+                    }
+                }
                 copy(index, stage.flattened_ud_buf.data(), 0,
                      stage.flattened_ud_buf.size() * sizeof(u32));
             }
@@ -1427,6 +1552,63 @@ bool Rasterizer::FilterDrawPasses() const {
     return !(mode == Mode::Disable && (depth_copy || stencil_copy));
 }
 
+// bbport-order (90): BB_ORDER_DRAWLOG=<file pemicu> -> 16 frame draw dicatat ke <pemicu>.txt
+namespace {
+struct BbDrawLog {
+    std::mutex m;
+    std::FILE* f = nullptr;
+    u32 start = 0;
+    u32 checked = ~0u;
+};
+BbDrawLog& BbDrawLogState() {
+    static BbDrawLog d;
+    return d;
+}
+/// Aktif? `rel` = frame ke berapa sejak pemicu.
+bool BbDrawLogOn(u32& rel) {
+    static const char* trig = std::getenv("BB_ORDER_DRAWLOG");
+    if (trig == nullptr) {
+        return false;
+    }
+    auto& d = BbDrawLogState();
+    std::scoped_lock lk{d.m};
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (d.f == nullptr) {
+        if (d.checked == frame) {
+            return false;
+        }
+        d.checked = frame;
+        std::FILE* t = std::fopen(trig, "r");
+        if (t == nullptr) {
+            return false;
+        }
+        std::fclose(t);
+        std::remove(trig);
+        d.f = std::fopen((std::string(trig) + ".txt").c_str(), "w");
+        d.start = frame;
+        std::printf("bbport-order (90): rekam draw 16 frame -> %s.txt\n", trig);
+        if (d.f == nullptr) {
+            return false;
+        }
+    }
+    rel = frame - d.start;
+    if (rel >= 16) {
+        std::fclose(d.f);
+        d.f = nullptr;
+        std::printf("bbport-order (90): rekam draw selesai\n");
+        return false;
+    }
+    return true;
+}
+void BbDrawLogWrite(const std::string& line) {
+    auto& d = BbDrawLogState();
+    std::scoped_lock lk{d.m};
+    if (d.f != nullptr) {
+        std::fputs(line.c_str(), d.f);
+    }
+}
+} // namespace
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
@@ -1666,6 +1848,20 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
+    if (BbOrderFullBarrier()) { // bbport-order (66)
+        scheduler.EndRendering();
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            const vk::MemoryBarrier2 mb{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            };
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &mb});
+        });
+    }
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -1684,7 +1880,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         .program = {vs_info.ProgramBase(), ps_info ? ps_info->ProgramBase() : 0},
         .count = {num_indices, num_instances, 0},
     };
+    const bool bb_skip = BbOrderSkipLive(crumb.hash[0]) || BbOrderSkipLive(crumb.hash[1]); // bbport-order (44)
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
+        if (bb_skip) {
+            return;
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
@@ -1692,9 +1892,68 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
         }
     });
+    if (u32 bb_rel = 0; BbDrawLogOn(bb_rel)) { // bbport-order (90)
+        const auto& bb_vp = regs.viewports[0]; // bbport-order (91): depth/clear/scissor/viewport
+        BbDrawLogWrite(fmt::format("{} D vs {:08x} ps {:08x} idx {} inst {} first {}/{} ib {:#x} rt {:#x}"
+                                   " z {:#x} zclr {} htile {:#x} zf {} zw {} gs {},{}-{},{} ss {},{}-{},{}"
+                                   " vp {:.0f},{:.0f} {:.0f}x{:.0f}\n",
+                                   bb_rel, vs_info.pgm_hash, ps_info ? ps_info->pgm_hash : 0,
+                                   num_indices, num_instances, first_vertex, first_instance,
+                                   is_indexed ? u64(regs.index_base_address.Address<VAddr>()) : 0,
+                                   regs.color_buffers[0] ? regs.color_buffers[0].Address() : 0,
+                                   regs.depth_buffer.DepthValid() ? u64(regs.depth_buffer.DepthAddress()) : 0,
+                                   u32(regs.depth_render_control.depth_clear_enable),
+                                   u64(regs.depth_htile_data_base.GetAddress()),
+                                   u32(regs.depth_control.depth_func), u32(regs.depth_control.depth_write_enable),
+                                   s32(regs.generic_scissor.top_left_x), s32(regs.generic_scissor.top_left_y),
+                                   s32(regs.generic_scissor.bottom_right_x), s32(regs.generic_scissor.bottom_right_y),
+                                   s32(regs.screen_scissor.top_left_x), s32(regs.screen_scissor.top_left_y),
+                                   s32(regs.screen_scissor.bottom_right_x), s32(regs.screen_scissor.bottom_right_y),
+                                   bb_vp.xoffset - bb_vp.xscale, bb_vp.yoffset - bb_vp.yscale,
+                                   bb_vp.xscale * 2, bb_vp.yscale * 2));
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
+        { // bbport-order (77): BB_ORDER_DIAG_PS -> info + dump image draw ini saat capture
+            static const char* bb_list = std::getenv("BB_ORDER_DIAG_PS");
+            if (bb_list != nullptr && ps != nullptr) {
+                bool bb_hit = false;
+                const char* p = bb_list;
+                while (*p != 0) {
+                    char* end = nullptr;
+                    const unsigned long long v = std::strtoull(p, &end, 16);
+                    if (end == p) {
+                        break;
+                    }
+                    bb_hit |= v == ps->pgm_hash || v == (ps->pgm_hash & 0xffffffffull);
+                    p = (*end == ',') ? end + 1 : end;
+                }
+                if (bb_hit) {
+                    char tag[32];
+                    std::snprintf(tag, sizeof(tag), "ps%08x", static_cast<u32>(ps->pgm_hash));
+                    const auto images = bound_images;
+                    for (const auto image_id : images) {
+                        const auto& im = texture_cache.GetImage(image_id);
+                        char note[320];
+                        std::snprintf(note, sizeof(note),
+                                      "\n  diag ps %08x img %#llx %ux%u fmt %d tile %u array %u "
+                                      "pitch %u gsize %u flags %#x samples %u mips %u layers %u",
+                                      static_cast<u32>(ps->pgm_hash),
+                                      static_cast<unsigned long long>(im.info.guest_address),
+                                      im.info.size.width, im.info.size.height,
+                                      static_cast<int>(im.info.pixel_format),
+                                      static_cast<u32>(im.info.tile_mode),
+                                      static_cast<u32>(im.info.array_mode), im.info.pitch,
+                                      im.info.guest_size, static_cast<u32>(im.flags),
+                                      im.info.num_samples, im.info.resources.levels,
+                                      im.info.resources.layers);
+                        FrameCapture::Note(note);
+                        texture_cache.BbOrderDumpImage(image_id, tag);
+                    }
+                }
+            }
+        }
         if (const auto& bc = regs.blend_control[0]; bc.enable && regs.color_buffers[0]) {
             char note[128];
             std::snprintf(note, sizeof(note), "\n  blend ps %08x idx %u: src %u dst %u func %u z %u%u",
@@ -1806,6 +2065,20 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
+    if (BbOrderFullBarrier()) { // bbport-order (66)
+        scheduler.EndRendering();
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            const vk::MemoryBarrier2 mb{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            };
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &mb});
+        });
+    }
     scheduler.BeginRendering(state);
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
@@ -1825,7 +2098,23 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         .address = indirect.args,
         .count = {max_count, stride, 0},
     };
+    if (u32 bb_rel = 0; BbDrawLogOn(bb_rel)) { // bbport-order (90)
+        u32 a[5]{};
+        std::memcpy(a, reinterpret_cast<const void*>(indirect.args), sizeof(a));
+        u32 cnt = 0;
+        if (count_address != 0) {
+            std::memcpy(&cnt, reinterpret_cast<const void*>(count_address), 4);
+        }
+        BbDrawLogWrite(fmt::format("{} I vs {:08x} ps {:08x} args {:#x} max {} count@{:#x}={} cpu [{} {} {} {} {}] rt {:#x}\n",
+                                   bb_rel, crumb.hash[0], crumb.hash[1], indirect.args, max_count,
+                                   count_address, cnt, a[0], a[1], a[2], a[3], a[4],
+                                   Regs().color_buffers[0] ? Regs().color_buffers[0].Address() : 0));
+    }
+    const bool bb_skip = BbOrderSkipLive(crumb.hash[0]) || BbOrderSkipLive(crumb.hash[1]); // bbport-order (44)
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
+        if (bb_skip) {
+            return;
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
             if (counts) {
@@ -1923,11 +2212,47 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         .program = {cs.ProgramBase(), 0},
         .count = {dim_x, dim_y, dim_z},
     };
+    bool bb_skip = BbOrderSkipLive(crumb.hash[0]) || BbOrderSkipLive(crumb.hash[1]); // bbport-order (44)
+    if (cs.pgm_hash == 0x92311acaull && !bb_skip && bound_images.size() >= 5) { // bbport-order (75)
+        const auto flat = cs.FlatUserData();
+        const float bb_scale = flat.size() > 63 ? std::bit_cast<float>(u32(flat[63])) : 0.0f;
+        if (upscaler->OrderTaa(bound_images[2], bound_images[1], bb_order_scene_depth,
+                               bound_images[bound_images.size() - 1], bb_scale)) {
+            bb_skip = true;
+        }
+    }
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
+        if (bb_skip) {
+            return;
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();
+    { // bbport-order (52): BB_ORDER_DIAG_CS -> image dispatch ini ditulis saat frame capture
+        static const char* list = std::getenv("BB_ORDER_DIAG_CS");
+        if (list != nullptr && FrameCapture::Active()) {
+            bool hit = false;
+            const char* p = list;
+            while (*p != 0) {
+                char* end = nullptr;
+                const unsigned long long v = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                hit |= v == cs.pgm_hash;
+                p = (*end == ',') ? end + 1 : end;
+            }
+            if (hit) {
+                char tag[32];
+                std::snprintf(tag, sizeof(tag), "cs%08x", static_cast<u32>(cs.pgm_hash));
+                const auto images = bound_images;
+                for (const auto image_id : images) {
+                    texture_cache.BbOrderDumpImage(image_id, tag);
+                }
+            }
+        }
+    }
 
     ResetBindings(true);
     scheduler.KickRecording();
@@ -2096,7 +2421,8 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
             !memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !IsBindableFormat(data_fmt, num_fmt)) {
+            !IsBindableFormat(data_fmt, num_fmt) || !IsKnownTileMode(tsharp.GetTileMode()) ||
+            !IsPlausibleImageSize(tsharp)) {
             continue; // null descriptor
         }
         const auto& entry =
@@ -2825,6 +3151,145 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                               u32(vsharp.GetStride()), f[0], f[1], f[2], f[3]);
                 FrameCapture::Note(note);
             }
+            { // bbport-order (62): BB_ORDER_VBDIAG / BB_ORDER_VBFRESH
+                struct BbVbList {
+                    u64 h[48]{};
+                    u32 n = 0;
+                    bool on = false;
+                };
+                static const auto parse = [](const char* name) {
+                    BbVbList l;
+                    const char* e = std::getenv(name);
+                    if (e == nullptr || e[0] == '\0' || e[0] == '0') {
+                        return l;
+                    }
+                    l.on = true;
+                    const char* p = (e[0] == '1' && e[1] == '\0')
+                                        ? "1077f760,70b542d,e0ec7fe0,429d950d,bd739cf5,231d370b,"
+                                          "190852fd,b2cc4b8f,b938dd39,a369ab85,59c67371,fd7e121b,b68b212f"
+                                        : e;
+                    while (*p && l.n < 48) {
+                        char* end = nullptr;
+                        const u64 v = std::strtoull(p, &end, 16);
+                        if (end == p) {
+                            break;
+                        }
+                        l.h[l.n++] = v;
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                    return l;
+                };
+                static const BbVbList diag = parse("BB_ORDER_VBDIAG");
+                static const BbVbList fresh = parse("BB_ORDER_VBFRESH");
+                const auto listed = [&](const BbVbList& l) {
+                    if (!l.on) {
+                        return false;
+                    }
+                    for (u32 i = 0; i < l.n; i++) {
+                        if (l.h[i] == stage.pgm_hash) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                const bool valid = vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
+                                   memory->IsValidGpuMapping(vsharp.base_address, 0);
+                if (valid && FrameCapture::Active() && listed(diag)) {
+                    const u64 sz = std::min<u64>(
+                        memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()), 64ull << 20);
+                    const auto* bytes = reinterpret_cast<const u8*>(vsharp.base_address);
+                    u64 fnv = 1469598103934665603ull;
+                    for (u64 i = 0; i < sz; i++) {
+                        fnv = (fnv ^ bytes[i]) * 1099511628211ull;
+                    }
+                    const auto* f = reinterpret_cast<const float*>(vsharp.base_address);
+                    char note[320];
+                    std::snprintf(note, sizeof(note),
+                                  "\n  vb vs %08x slot %u at %#llx size %u stride %u w%d paged%d "
+                                  "cpumod%d gpumod%d fnv %016llx: %g %g %g %g",
+                                  u32(stage.pgm_hash), binding.buffer,
+                                  (unsigned long long)vsharp.base_address, u32(vsharp.GetSize()),
+                                  u32(vsharp.GetStride()), int(desc.is_written),
+                                  0 /* bbport-order-win: paged */,
+                                  int(buffer_cache.IsRegionCpuModified(vsharp.base_address, sz)),
+                                  int(buffer_cache.IsRegionGpuModified(vsharp.base_address, sz)),
+                                  (unsigned long long)fnv, f[0], f[1], f[2], f[3]);
+                    FrameCapture::Note(note);
+                }
+                { // bbport-order (65): BB_ORDER_BONERACE=1
+                    static const bool bb_race = [] {
+                        const char* e = std::getenv("BB_ORDER_BONERACE");
+                        return e != nullptr && e[0] == '1';
+                    }();
+                    static const BbVbList race_list = parse("BB_ORDER_BONERACE_LIST");
+                    const bool race_hit =
+                        race_list.on ? listed(race_list)
+                                     : (stage.pgm_hash == 0x1077f760 || stage.pgm_hash == 0x70b542d ||
+                                        stage.pgm_hash == 0xe0ec7fe0 || stage.pgm_hash == 0x429d950d ||
+                                        stage.pgm_hash == 0xb938dd39);
+                    if (bb_race && valid && !desc.is_written && race_hit &&
+                        vsharp.GetSize() > [] { // bbport-order (70): BB_ORDER_BONERACE_MIN (byte)
+                            const char* e = std::getenv("BB_ORDER_BONERACE_MIN");
+                            return e != nullptr ? u32(std::strtoul(e, nullptr, 10)) : (1u << 20);
+                        }()) {
+                        static std::mutex rm;
+                        static u32 r_frame = ~0u, r_frames = 0, r_changed = 0, r_cpumod = 0;
+                        static std::unordered_map<u64, u64> r_seen;
+                        static bool r_flag = false;
+                        static auto r_last = std::chrono::steady_clock::now();
+                        const u64 sz = std::min<u64>(
+                            memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()), 16ull << 20);
+                        const auto* bytes = reinterpret_cast<const u64*>(vsharp.base_address);
+                        u64 fnv = 1469598103934665603ull;
+                        for (u64 i = 0; i < sz / 8; i++) {
+                            fnv = (fnv ^ bytes[i]) * 1099511628211ull;
+                        }
+                        const bool cm = buffer_cache.IsRegionCpuModified(vsharp.base_address, sz);
+                        std::scoped_lock lk{rm};
+                        const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+                        if (frame != r_frame) {
+                            r_frame = frame;
+                            r_seen.clear();
+                            ++r_frames;
+                            r_flag = false;
+                        }
+                        auto [it, inserted] = r_seen.emplace(vsharp.base_address, fnv);
+                        if (!inserted && it->second != fnv) {
+                            it->second = fnv;
+                            if (!r_flag) {
+                                ++r_changed;
+                                r_flag = true;
+                            }
+                            r_cpumod += cm ? 1 : 0;
+                            static u32 r_told = 0; // bbport-order (70): alamat yang berubah
+                            if (r_told < 40) {
+                                ++r_told;
+                                std::printf("bbport-order (70): berubah di tengah frame: vs %08x slot %u "
+                                            "%#llx ukuran %u stride %u cpumod %d\n",
+                                            u32(stage.pgm_hash), binding.buffer,
+                                            (unsigned long long)vsharp.base_address,
+                                            u32(vsharp.GetSize()), u32(vsharp.GetStride()), int(cm));
+                                std::fflush(stdout);
+                            }
+                        }
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - r_last > std::chrono::seconds(2)) {
+                            r_last = now;
+                            std::printf("bbport-order (65): tulang berubah di tengah frame: %u dari %u "
+                                        "frame (cpumod saat berubah %u)\n",
+                                        r_changed, r_frames, r_cpumod);
+                            std::fflush(stdout);
+                            r_frames = r_changed = r_cpumod = 0;
+                        }
+                    }
+                }
+                if (valid && !desc.is_written && listed(fresh)) {
+                    const u64 sz = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                    if (!buffer_cache.IsRegionGpuModified(vsharp.base_address, sz)) {
+                        buffer_cache.InvalidateMemory(vsharp.base_address, sz);
+                    }
+                }
+            }
             if (FrameCapture::Active() && vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 FrameCapture::Buffer(stage.pgm_hash, binding.buffer, vsharp.base_address,
@@ -2832,6 +3297,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                      memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+            } else if (BbOrderRejectBigBuffer(vsharp.GetSize())) {
+                // bbport-order: The Order macet di menu karena satu binding ±1,5 GB di-upload
+                // tiap frame. Buffer asli game jauh lebih kecil; yang sebesar ini dianggap sampah
+                // (BB_ORDER_BIG_BUFFER=1 mematikan pengaman ini untuk perbandingan).
+                static std::atomic<u32> told{0};
+                if (told.fetch_add(1) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "bbport-order: V# raksasa ditolak: shader {:#x} slot {} alamat {:#x} "
+                                "ukuran {} MB stride {} tulis {}",
+                                stage.pgm_hash, binding.buffer, vsharp.base_address,
+                                vsharp.GetSize() >> 20, vsharp.GetStride(), desc.is_written);
+                }
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
@@ -2912,13 +3390,48 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
     return entry;
 }
 
+// bbport-order (42): BB_ORDER_NULLTEX_FILE = file berisi "<hash hex> <mask hex>".
+static std::atomic<unsigned long long> bb_order_nt_hash{0}, bb_order_nt_mask{0};
+static void BbOrderNullTexReload() {
+    static const char* path = std::getenv("BB_ORDER_NULLTEX_FILE");
+    if (path == nullptr) {
+        return;
+    }
+    static std::atomic<long long> next{0};
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    long long expected = next.load(std::memory_order_relaxed);
+    if (now < expected || !next.compare_exchange_strong(expected, now + 500)) {
+        return;
+    }
+    unsigned long long h = 0, m = 0;
+    if (FILE* f = std::fopen(path, "r")) {
+        if (std::fscanf(f, "%llx %llx", &h, &m) < 1) {
+            h = 0;
+        }
+        std::fclose(f);
+    }
+    if (bb_order_nt_hash.exchange(h) != h || bb_order_nt_mask.exchange(m) != m) {
+        std::printf("bbport-order (42): null tekstur shader %llx mask %#llx\n", h, m);
+        std::fflush(stdout);
+    }
+}
+static bool BbOrderNullTexActive(u64 hash) {
+    BbOrderNullTexReload();
+    const auto h = bb_order_nt_hash.load(std::memory_order_relaxed);
+    return h != 0 && h == hash;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
     BB_SECTION(BindTextures);
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
-    if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
+    const bool bb_order_nt = BbOrderNullTexActive(stage.pgm_hash); // bbport-order (42)
+    if (!on_helper && !bb_order_nt &&
+        BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
         // Descriptor writes: one per image (no mip arrays in a memoized set).
         for (u32 i = 0; i < stage.images.size(); ++i) {
             auto& set_write = set_writes[write_index++];
@@ -2958,6 +3471,37 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 
+        if (bb_order_nt) { // bbport-order (42): catat T#, ikat null kalau bit-nya di mask
+            static std::mutex told_m;
+            static std::unordered_set<unsigned long long> told;
+            const unsigned long long key = (stage.pgm_hash << 8) ^ image_index ^
+                                           (unsigned long long)(tsharp.Address() << 20);
+            bool first;
+            {
+                std::scoped_lock lock{told_m};
+                first = told.size() < 2000 && told.insert(key).second;
+            }
+            if (first) {
+                std::printf("bbport-order (42): ps %llx img %u %#llx %ux%u depth %u type %u tile %u "
+                            "fmt %u/%u mip %u..%u array %u..%u pitch %u written %d\n",
+                            (unsigned long long)stage.pgm_hash, image_index,
+                            (unsigned long long)tsharp.Address(), u32(tsharp.width) + 1,
+                            u32(tsharp.height) + 1, u32(tsharp.depth) + 1, u32(tsharp.GetType()),
+                            u32(tsharp.GetTileMode()), u32(tsharp.GetDataFmt()),
+                            u32(tsharp.GetNumberFmt()), u32(tsharp.base_level),
+                            u32(tsharp.last_level), u32(tsharp.base_array), u32(tsharp.last_array),
+                            u32(tsharp.Pitch()), int(image_desc.is_written));
+                std::fflush(stdout);
+            }
+            if (image_index < 64 && ((bb_order_nt_mask.load() >> image_index) & 1) != 0) {
+                image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
+                image_binding_entries.push_back(nullptr);
+                binding_proxy_ok.push_back(false);
+                image_descriptor_array_sizes.push_back(1);
+                continue;
+            }
+        }
+
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
@@ -2969,7 +3513,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !IsBindableFormat(data_fmt, num_fmt)) {
+            !IsBindableFormat(data_fmt, num_fmt) || !IsKnownTileMode(tsharp.GetTileMode()) ||
+            !IsPlausibleImageSize(tsharp)) {
+            if (u32(tsharp.width) + 1 >= 512) { // bbport-order (29): diagnosa T# lebar yang ditolak
+                static std::atomic<u32> told29{0};
+                if (told29.fetch_add(1) < 64) {
+                    LOG_WARNING(Render_Vulkan,
+                                "bbport-order (29): T# lebar ditolak {:#x}: {}x{} pitch {} depth {} "
+                                "layer {} array {}..{} type {} tile {} fmt {}/{} mip {}..{} pow2pad {} | "
+                                "map={} fmt_ok={} tile_ok={} size_ok={}",
+                                tsharp.Address(), u32(tsharp.width) + 1, u32(tsharp.height) + 1,
+                                tsharp.Pitch(), u32(tsharp.depth) + 1, tsharp.NumLayers(),
+                                u32(tsharp.base_array), u32(tsharp.last_array), u32(tsharp.GetType()),
+                                u32(tsharp.GetTileMode()), u32(data_fmt), u32(num_fmt),
+                                u32(tsharp.base_level), u32(tsharp.last_level), u32(tsharp.pow2pad),
+                                memory->IsValidGpuMapping(tsharp.Address(), 0),
+                                IsKnownFormat(data_fmt, num_fmt), IsKnownTileMode(tsharp.GetTileMode()),
+                                IsPlausibleImageSize(tsharp));
+                }
+            }
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
                         "data_format={}, num_format={}",
@@ -2995,8 +3557,81 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         auto& desc_entry =
             prepared ? CachedImageDescEntry(tsharp, image_desc, prepared->image_hashes[image_index])
                      : CachedImageDescEntry(tsharp, image_desc);
+        if (desc_entry.desc.info.guest_size > (512u << 20)) { // bbport-order (26): T# sampah
+            static std::atomic<u32> told{0};
+            if (told.fetch_add(1) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "bbport-order: T# raksasa ditolak {} MB di {:#x}: {}x{} pitch {} layer {} "
+                            "data_format {}",
+                            desc_entry.desc.info.guest_size >> 20, tsharp.Address(), tsharp.width + 1,
+                            tsharp.height + 1, tsharp.Pitch(), tsharp.NumLayers(), u32(data_fmt));
+            }
+            image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
+            image_binding_entries.push_back(nullptr);
+            binding_proxy_ok.push_back(false);
+            image_descriptor_array_sizes.push_back(1);
+            continue;
+        }
         // BB_SCENE_DEBUG: proxied scene targets this binding reads at the native size, and why.
         const auto debug_native = [&](const VideoCore::Image& image) {
+            { // bbport-order (80): BB_ORDER_MEMHASH -> hash memori game di alamat texture
+                static const char* bb_mh_list = std::getenv("BB_ORDER_MEMHASH");
+                static const bool bb_mh_refresh = [] {
+                    const char* e = std::getenv("BB_ORDER_MEMHASH_REFRESH");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (bb_mh_list != nullptr && image.info.guest_size != 0) {
+                    bool bb_mh_hit = false;
+                    const char* p = bb_mh_list;
+                    while (*p != 0) {
+                        char* end = nullptr;
+                        const unsigned long long v = std::strtoull(p, &end, 16);
+                        if (end == p) {
+                            break;
+                        }
+                        bb_mh_hit |= v == image.info.guest_address;
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                    if (bb_mh_hit) {
+                        static std::mutex bb_mh_mutex;
+                        static std::unordered_map<VAddr, u64> bb_mh_last;
+                        static u32 bb_mh_told = 0, bb_mh_binds = 0;
+                        const u64 h = XXH3_64bits(
+                            reinterpret_cast<const void*>(image.info.guest_address),
+                            image.info.guest_size);
+                        std::scoped_lock bb_mh_lock{bb_mh_mutex};
+                        ++bb_mh_binds;
+                        auto [it, fresh] = bb_mh_last.try_emplace(image.info.guest_address, h);
+                        if (fresh || it->second != h) {
+                            it->second = h;
+                            if (bb_mh_told++ < 200) {
+                                std::printf("bbport-order (80): memori %#llx berubah (hash %016llx, "
+                                            "bind ke-%u, flags %#x)%s\n",
+                                            (unsigned long long)image.info.guest_address,
+                                            (unsigned long long)h, bb_mh_binds,
+                                            u32(image.flags),
+                                            bb_mh_refresh && !fresh ? " -> dibaca ulang" : "");
+                                std::fflush(stdout);
+                            }
+                            if (bb_mh_refresh && !fresh) {
+                                const_cast<VideoCore::Image&>(image).flags |=
+                                    VideoCore::ImageFlagBits::CpuDirty;
+                            }
+                        }
+                    }
+                }
+            }
+            { // bbport-order (78): BB_ORDER_REFRESH_SMALL=1 -> texture kecil dibaca ulang tiap bind
+                static const bool bb_refresh = [] {
+                    const char* e = std::getenv("BB_ORDER_REFRESH_SMALL");
+                    return e != nullptr && e[0] == '1';
+                }();
+                if (bb_refresh && !image_desc.is_written && !image.binding.is_target &&
+                    !image.info.props.is_depth && image.info.size.width <= 128 &&
+                    image.info.size.height <= 128) {
+                    const_cast<VideoCore::Image&>(image).flags |= VideoCore::ImageFlagBits::CpuDirty;
+                }
+            }
             if (!scene_debug_frame || proxy_candidate || !image.scene_proxy) return;
             std::printf("Scene native read: %s %016llx %s %ux%u needs_native %d written %d "
                         "bindings %u mip_fallback %d\n",
@@ -3634,10 +4269,49 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
+        bool is_depth_clear =
             (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
              regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
+            ([] { // bbport-order (92): BB_ORDER_NO_METACLEAR=1 -> abaikan status clear HTILE
+                static const bool off = [] {
+                    const char* e = std::getenv("BB_ORDER_NO_METACLEAR");
+                    return e != nullptr && e[0] == '1';
+                }();
+                return off;
+            }() ? false : texture_cache.IsMetaCleared(htile_address, slice));
+        { // bbport-order (64): diagnosa / paksa clear depth G-buffer
+            static const bool bb_zclear = [] {
+                const char* e = std::getenv("BB_ORDER_ZCLEAR");
+                return e != nullptr && e[0] == '1';
+            }();
+            static u32 bb_zclear_frame = ~0u;
+            bool forced = false;
+            const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+            if (bb_zclear && !is_depth_clear && state.num_color_attachments == 3 &&
+                regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
+                bb_zclear_frame != frame) {
+                is_depth_clear = true;
+                forced = true;
+            }
+            if (state.num_color_attachments == 3 && regs.depth_control.depth_write_enable) {
+                bb_zclear_frame = frame;
+            }
+            if (FrameCapture::Active()) {
+                char note[200];
+                std::snprintf(note, sizeof(note),
+                              "\n  zatt clear %d%s val %08x htile %#llx meta %d func %u test %u "
+                              "write %u ncol %u frame %u",
+                              int(is_depth_clear), forced ? " (dipaksa)" : "",
+                              std::bit_cast<u32>(regs.depth_clear),
+                              (unsigned long long)htile_address,
+                              int(texture_cache.IsMetaCleared(htile_address, slice)),
+                              u32(regs.depth_control.depth_func),
+                              u32(regs.depth_control.depth_enable),
+                              u32(regs.depth_control.depth_write_enable),
+                              u32(state.num_color_attachments), frame);
+                FrameCapture::Note(note);
+            }
+        }
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
@@ -4037,9 +4711,98 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
+// bbport-order (93): vertex shader draw yang sedang disiapkan, untuk perbaikan bintik wajah.
+static thread_local u64 bb_order_ff_vs = 0;
+static thread_local u64 bb_order_ff_ps = 0; // bbport-order (94)
+// bbport-order (95): EQUAL -> LEQUAL (+bias) hanya bila BB_ORDER_FACEFIX_EQUAL=1
+static bool BbOrderFaceFixEqualOk() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_FACEFIX_EQUAL");
+        const bool v = e != nullptr && e[0] == '1';
+        std::printf("bbport-order (95): face fix untuk draw EQUAL: %s\n", v ? "ya (lama)" : "tidak");
+        std::fflush(stdout);
+        return v;
+    }();
+    return on;
+}
+static bool BbOrderFaceFixPsOk() {
+    struct List {
+        u64 h[32]{};
+        u32 n = 0;
+    };
+    static const List list = [] {
+        List l;
+        const char* e = std::getenv("BB_ORDER_FACEFIX_PS");
+        const char* p = (e != nullptr && e[0] != '\0') ? e : "f5c17eec";
+        while (*p && l.n < 32) {
+            char* end = nullptr;
+            const u64 v = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            l.h[l.n++] = v;
+            p = (*end == ',') ? end + 1 : end;
+        }
+        std::printf("bbport-order (94): face fix untuk pixel shader %s\n", (e != nullptr && e[0] != '\0') ? e : "f5c17eec");
+        std::fflush(stdout);
+        return l;
+    }();
+    for (u32 i = 0; i < list.n; ++i) {
+        if (list.h[i] == bb_order_ff_ps) {
+            return true;
+        }
+    }
+    return false;
+}
+static bool BbOrderFaceFixVsOk() {
+    if (BbOrderFaceFixPsOk()) { // bbport-order (94)
+        return true;
+    }
+    struct List {
+        u64 h[48]{};
+        u32 n = 0;
+        bool all = false;
+    };
+    static const List list = [] {
+        List l;
+        const char* e = std::getenv("BB_ORDER_FACEFIX_VS");
+        if (e == nullptr || e[0] == '\0' || e[0] == 'a' || e[0] == 'A') { // bbport-order (95): bawaan semua
+            l.all = true;
+        }
+        const char* p = (e != nullptr && !l.all && e[0] != '\0') ? e : ""; // bbport-order (94): bawaan kosong
+        while (!l.all && *p && l.n < 48) {
+            char* end = nullptr;
+            const u64 v = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            l.h[l.n++] = v;
+            p = (*end == ',') ? end + 1 : end;
+        }
+        std::printf("bbport-order (93): face fix vertex shader: %s\n",
+                    l.all ? "semua draw" : (l.n ? "daftar BB_ORDER_FACEFIX_VS" : "-"));
+        std::fflush(stdout);
+        return l;
+    }();
+    if (list.all) {
+        return true;
+    }
+    for (u32 i = 0; i < list.n; ++i) {
+        if (list.h[i] == bb_order_ff_vs) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
     BB_SECTION(UpdateDynamicState);
     UpdateViewportScissorState();
+    bb_order_ff_vs = pipeline ? pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash : 0; // bbport-order (93)
+    { // bbport-order (94)
+        const auto* bb_ps = pipeline ? pipeline->GetStages()[u32(Shader::SwStage::Fragment)] : nullptr;
+        bb_order_ff_ps = bb_ps ? bb_ps->pgm_hash : 0;
+    }
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
@@ -4197,26 +4960,123 @@ void Rasterizer::UpdateViewportScissorState() const {
     dynamic_state.SetScissors(scissors);
 }
 
+// bbport-order (50): BB_ORDER_DSFLAGS_FILE -> bit 1 stencil, 2 depth bounds, 4 depth test (tanpa
+// tulis), 8 depth bias dimatikan.
+static int BbOrderDsFlags() {
+    static const char* path = std::getenv("BB_ORDER_DSFLAGS_FILE");
+    static std::atomic<int> flags{0};
+    static std::atomic<long long> next{0};
+    if (path == nullptr) {
+        return 0;
+    }
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    long long expected = next.load(std::memory_order_relaxed);
+    if (now >= expected && next.compare_exchange_strong(expected, now + 500)) {
+        int v = 0;
+        if (FILE* f = std::fopen(path, "r")) {
+            if (std::fscanf(f, "%d", &v) != 1) {
+                v = 0;
+            }
+            std::fclose(f);
+        }
+        if (flags.exchange(v) != v) {
+            std::printf("bbport-order (50): depth/stencil flags %d\n", v);
+            std::fflush(stdout);
+        }
+    }
+    return flags.load(std::memory_order_relaxed);
+}
+
+// bbport-order (71): mode perbaikan bintik wajah. 0 mati, 1 draw tanpa tulis depth, 2 lama (59)
+static int BbOrderFaceFixMode() {
+    static const int mode = [] {
+        const char* e = std::getenv("BB_ORDER_FACEFIX");
+        int m = 1;
+        if (e != nullptr && e[0] == '0') {
+            m = 0;
+        } else if (e != nullptr && (e[0] == '2' || e[0] == 'o')) {
+            m = 2;
+        }
+        std::printf("bbport-order (71): face fix mode %d\n", m);
+        std::fflush(stdout);
+        return m;
+    }();
+    return mode;
+}
+
 void Rasterizer::UpdateDepthStencilState() const {
     const auto& regs = Regs();
     auto& dynamic_state = scheduler.GetDynamicState();
 
     const auto depth_test_enabled =
-        regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
+        regs.depth_control.depth_enable && regs.depth_buffer.DepthValid() &&
+        !((BbOrderDsFlags() & 4) != 0 && !regs.depth_control.depth_write_enable) && // bbport-order (50)
+        (BbOrderDsFlags() & 16) == 0 && // bbport-order (56): semua draw
+        !((BbOrderDsFlags() & 32) != 0 && regs.color_buffers[0] && regs.color_buffers[1]); // bbport-order (57)
     dynamic_state.SetDepthTestEnabled(depth_test_enabled);
     if (depth_test_enabled) {
         dynamic_state.SetDepthWriteEnabled(regs.depth_control.depth_write_enable &&
                                            !regs.depth_render_control.depth_clear_enable);
-        dynamic_state.SetDepthCompareOp(LiverpoolToVK::CompareOp(regs.depth_control.depth_func));
+        auto bb_cmp = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
+        { // bbport-order (48): BB_ORDER_DEPTHEQ_FILE -> EQUAL tanpa tulis depth diganti
+            static const char* path = std::getenv("BB_ORDER_DEPTHEQ_FILE");
+            static std::atomic<int> mode{0};
+            static std::atomic<long long> next{0};
+            static std::atomic<bool> told{false};
+            if (path != nullptr) {
+                const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count();
+                long long expected = next.load(std::memory_order_relaxed);
+                if (now >= expected && next.compare_exchange_strong(expected, now + 500)) {
+                    int m = 0;
+                    if (FILE* f = std::fopen(path, "r")) {
+                        if (std::fscanf(f, "%d", &m) != 1) {
+                            m = 0;
+                        }
+                        std::fclose(f);
+                    }
+                    if (mode.exchange(m) != m) {
+                        std::printf("bbport-order (48): depth EQUAL mode %d\n", m);
+                        std::fflush(stdout);
+                    }
+                }
+                const bool writes = regs.depth_control.depth_write_enable &&
+                                    !regs.depth_render_control.depth_clear_enable;
+                if (bb_cmp == vk::CompareOp::eEqual && !writes) {
+                    if (!told.exchange(true)) {
+                        std::printf("bbport-order (48): game memakai depth EQUAL tanpa tulis\n");
+                        std::fflush(stdout);
+                    }
+                    switch (mode.load(std::memory_order_relaxed)) {
+                    case 1: bb_cmp = vk::CompareOp::eLessOrEqual; break;
+                    case 2: bb_cmp = vk::CompareOp::eGreaterOrEqual; break;
+                    case 3: bb_cmp = vk::CompareOp::eAlways; break;
+                    default: break;
+                    }
+                }
+            }
+        }
+        if (BbOrderFaceFixMode() == 1 && bb_cmp == vk::CompareOp::eEqual && regs.color_buffers[0] &&
+            BbOrderFaceFixVsOk() && BbOrderFaceFixEqualOk() && // bbport-order (93/95)
+            !(regs.depth_control.depth_write_enable &&
+              !regs.depth_render_control.depth_clear_enable)) { // bbport-order (71)
+            bb_cmp = vk::CompareOp::eLessOrEqual;
+        }
+        dynamic_state.SetDepthCompareOp(bb_cmp);
     }
 
-    const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
+    const auto depth_bounds_test_enabled =
+        regs.depth_control.depth_bounds_enable && (BbOrderDsFlags() & 2) == 0; // bbport-order (50)
     dynamic_state.SetDepthBoundsTestEnabled(depth_bounds_test_enabled);
     if (depth_bounds_test_enabled) {
         dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
     }
 
-    const auto depth_bias_enabled = regs.polygon_control.NeedsBias();
+    const auto depth_bias_enabled =
+        regs.polygon_control.NeedsBias() && (BbOrderDsFlags() & 8) == 0; // bbport-order (50)
     dynamic_state.SetDepthBiasEnabled(depth_bias_enabled);
     if (depth_bias_enabled) {
         const bool front = regs.polygon_control.enable_polygon_offset_front;
@@ -4225,9 +5085,72 @@ void Rasterizer::UpdateDepthStencilState() const {
             regs.poly_offset.depth_bias,
             (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
     }
+    { // bbport-order (59): perbaikan bintik wajah, kedalaman pass warna vs prepass
+        const int bb_ff = BbOrderFaceFixMode(); // bbport-order (71)
+        const bool bb_ff_writes = regs.depth_control.depth_write_enable &&
+                                  !regs.depth_render_control.depth_clear_enable;
+        const bool bb_ff_hit =
+            bb_ff == 2 ? (!depth_bias_enabled && regs.color_buffers[0] && regs.color_buffers[1])
+                       : (bb_ff == 1 && !bb_ff_writes && regs.color_buffers[0] && BbOrderFaceFixVsOk() &&
+                          (regs.depth_control.depth_func != AmdGpu::CompareFunc::Equal ||
+                           BbOrderFaceFixEqualOk())); // (93/95)
+        if (bb_ff_hit && (BbOrderDsFlags() & (64 | 128)) == 0 && depth_test_enabled) {
+            dynamic_state.SetDepthBiasEnabled(true);
+            static const char* fb_path = std::getenv("BB_ORDER_FACEBIAS_FILE"); // bbport-order (60)
+            static float fb_def_c = 256.f, fb_def_s = 0.f; // bbport-order (72) (76: slope 0)
+            static const bool fb_def_read = [] {
+                if (const char* e = std::getenv("BB_ORDER_FACEBIAS")) {
+                    float c = 256.f, s = 0.f;
+                    if (std::sscanf(e, "%f %f", &c, &s) >= 1) {
+                        fb_def_c = c;
+                        fb_def_s = s;
+                    }
+                }
+                std::printf("bbport-order (72): face bias bawaan %.1f slope %.2f\n", fb_def_c, fb_def_s);
+                std::fflush(stdout);
+                return true;
+            }();
+            (void)fb_def_read;
+            static std::atomic<float> fb_const{fb_def_c}, fb_slope{fb_def_s};
+            static std::atomic<long long> fb_next{0};
+            if (fb_path != nullptr) {
+                const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count();
+                long long expected = fb_next.load(std::memory_order_relaxed);
+                if (now >= expected && fb_next.compare_exchange_strong(expected, now + 500)) {
+                    float c = fb_def_c, s = fb_def_s; // bbport-order (72)
+                    if (FILE* f = std::fopen(fb_path, "r")) {
+                        if (std::fscanf(f, "%f %f", &c, &s) < 1) {
+                            c = fb_def_c;
+                        }
+                        std::fclose(f);
+                    }
+                    if (fb_const.exchange(c) != c || fb_slope.exchange(s) != s) {
+                        std::printf("bbport-order (60): face bias %.1f slope %.2f\n", c, s);
+                        std::fflush(stdout);
+                    }
+                }
+            }
+            float bb_gc = 0.f, bb_gs = 0.f; // bbport-order (71): bias game ditambahkan
+            if (depth_bias_enabled) {
+                const bool bb_front = regs.polygon_control.enable_polygon_offset_front;
+                bb_gc = bb_front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset;
+                bb_gs = (bb_front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f;
+            }
+            dynamic_state.SetDepthBias(bb_gc - fb_const.load(), 0.f, bb_gs - fb_slope.load());
+        }
+    }
+    if ((BbOrderDsFlags() & (64 | 128)) != 0 && regs.color_buffers[0] &&
+        regs.color_buffers[1]) { // bbport-order (58): depth bias diagnosa untuk pass warna
+        const float sign = (BbOrderDsFlags() & 64) != 0 ? -1.f : 1.f;
+        dynamic_state.SetDepthBiasEnabled(true);
+        dynamic_state.SetDepthBias(sign * 64.f, 0.f, sign * 1.f);
+    }
 
-    const auto stencil_test_enabled =
-        regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
+    const auto stencil_test_enabled = regs.depth_control.stencil_enable &&
+                                      regs.depth_buffer.StencilValid() &&
+                                      (BbOrderDsFlags() & 1) == 0; // bbport-order (50)
     dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
     if (stencil_test_enabled) {
         const StencilOps front_ops{

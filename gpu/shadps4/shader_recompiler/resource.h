@@ -3,13 +3,70 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
+#include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/resource.h"
 
 #include <boost/container/static_vector.hpp>
 
 namespace Shader {
+
+/// bbport-order: daftar hash shader dari env (hex, dipisah koma; "0" = kosong), bawaan = shader
+/// material The Order yang diketahui meledak permutasinya.
+inline bool BbOrderHashListed(const char* env, u64 pgm_hash) {
+    struct List {
+        u64 h[32]{};
+        u32 n = 0;
+    };
+    static List lists[2];
+    static const char* names[2] = {"BB_ORDER_LOOSE_SHADER", "BB_ORDER_FLAT2D_SHADER"};
+    static const bool ready = [] {
+        for (int k = 0; k < 2; k++) {
+            const char* e = std::getenv(names[k]);
+            const char* p = e ? e : (k == 0 ? "804aeead,c75dd317,a8792bbb,8c8a4817,ad441fb1,539eee77" : "804aeead,c75dd317,a8792bbb,8c8a4817,ad441fb1"); // bbport-order (84)
+            while (*p && lists[k].n < 32) {
+                char* end = nullptr;
+                const u64 v = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                if (v != 0) {
+                    lists[k].h[lists[k].n++] = v;
+                }
+                p = (*end == ',') ? end + 1 : end;
+            }
+        }
+        return true;
+    }();
+    (void)ready;
+    const List& l = lists[env[9] == 'L' ? 0 : 1]; // "BB_ORDER_L..." atau "BB_ORDER_F..."
+    for (u32 i = 0; i < l.n; i++) {
+        if (l.h[i] == pgm_hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// bbport-order: compute shader The Order 0x804aeead mengambil sampel dari +-30 texture per dispatch
+/// dengan tipe acak (1D/2D/3D/cube/MSAA) -> ratusan permutasi dan stutter. Untuk shader ini hanya
+/// texture 2D yang dipakai; tipe lain dibaca sebagai T# kosong (sampel 0) di SEMUA tahap (spesialisasi,
+/// recompiler, binding), jadi cukup satu permutasi. BB_ORDER_FLAT2D_SHADER=hex (0 = mati).
+/// bbport-order (24): texture integer di shader material juga dianggap kosong (BB_ORDER_FLAT_INT=0: mati).
+inline bool BbOrderFlatInt() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_FLAT_INT");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+
+inline bool BbOrderFlat2D(u64 pgm_hash) {
+    return BbOrderHashListed("BB_ORDER_FLAT2D_SHADER", pgm_hash);
+}
 
 static constexpr u32 NUM_USER_DATA_REGS = 16;
 static constexpr u32 NUM_IMAGES = 64;
@@ -143,6 +200,11 @@ struct ImageResource {
                 data_fmt != AmdGpu::DataFormat::Format32) {
                 image = AmdGpu::Image::Null(true);
             }
+        }
+        if (BbOrderFlat2D(info.pgm_hash) && image.base_address != 0 &&
+            (image.GetViewType(is_array) != AmdGpu::ImageType::Color2D || image.IsCube() ||
+             (BbOrderFlatInt() && AmdGpu::IsInteger(image.GetNumberFmt())))) {
+            image = AmdGpu::Image::Null(is_depth); // bbport-order: lihat BbOrderFlat2D
         }
         return image;
     }

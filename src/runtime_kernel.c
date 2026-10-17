@@ -428,6 +428,57 @@ static int condattr_marker;
 static ABI int32_t condattr_init(void **attr) { if (!attr) return ERR(22); *attr=&condattr_marker; return 0; }
 static ABI int32_t condattr_destroy(void **attr) { if (!attr || !*attr) return ERR(22); *attr=NULL; return 0; }
 
+/* ---- bbport-order: stub offline The Order: 1886 ---- */
+#define ORDER_LOG(name) do { static int n_; if (n_ < 4) { n_++; printf("Runtime: order-stub %s\n", name); } } while (0)
+static ABI int32_t order_ok(void) { ORDER_LOG("no-op -> 0"); return 0; }
+/* libSceIme keyboard (USB keyboard untuk chat/teks): tidak ada keyboard terhubung. */
+static ABI int32_t order_ime_kbd_open(int32_t user, const void *param) {
+    (void)user; (void)param;
+    ORDER_LOG("sceImeKeyboardOpen -> 0");
+    return 0;
+}
+/* sceImeKeyboardGetResourceId(userId, SceImeKeyboardResourceIdArray*): {s32 userId; u32 resourceId[5];} */
+static ABI int32_t order_ime_kbd_resource(int32_t user, int32_t *ids) {
+    ORDER_LOG("sceImeKeyboardGetResourceId -> tidak ada keyboard");
+    if (!ids) return (int32_t)0x80BC0001; /* SCE_IME_ERROR_INVALID_ADDRESS (kode belum diverifikasi) */
+    memset(ids, 0, 6 * sizeof(int32_t));
+    ids[0] = user;
+    return 0;
+}
+/* SaveDataDialog: dialog selalu langsung selesai (save/load berjalan tanpa jendela). */
+static ABI int32_t order_save_dialog_ready(void) { return 1; }
+static ABI int32_t order_save_dialog_result(void *result) {
+    ORDER_LOG("sceSaveDataDialogGetResult -> OK");
+    if (result) memset(result, 0, 16); /* mode, result=0 (OK), buttonId; sisanya tidak disentuh */
+    return 0;
+}
+/* Add-on content: tidak ada DLC yang ter-mount (content_profile: mounted add-ons=0). */
+#define ORDER_ADDCONT_NOT_FOUND ((int32_t)0x80D90005)
+static ABI int32_t order_addcont_none(void) { ORDER_LOG("sceAppContentAddcont* -> NOT_FOUND"); return ORDER_ADDCONT_NOT_FOUND; }
+/* select(nfds, r, w, e, timeout): tidak ada socket yang siap; tunggu sesuai timeout. */
+typedef struct { int64_t sec, usec; } OrderTimeval;
+static ABI int32_t order_select(int32_t nfds, void *r, void *w, void *e, const OrderTimeval *timeout) {
+    (void)nfds; (void)r; (void)w; (void)e;
+    ORDER_LOG("select -> 0 (timeout)");
+    if (timeout && (timeout->sec > 0 || timeout->usec > 0)) {
+        struct timespec ts = { (time_t)timeout->sec, (long)(timeout->usec * 1000) };
+        if (ts.tv_sec > 1) ts.tv_sec = 1;
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+/* sceKernelGetdents: direktori dianggap kosong (0 byte = akhir daftar). */
+static __attribute__((unused)) ABI int32_t order_getdents(int32_t fd, char *buf, int32_t size) {
+    (void)fd; (void)buf; (void)size;
+    ORDER_LOG("sceKernelGetdents -> 0 (kosong)");
+    return 0;
+}
+static __attribute__((unused)) ABI int32_t order_module_info_from_addr(const void *addr, int32_t flags, void *info) {
+    (void)addr; (void)flags; (void)info;
+    ORDER_LOG("sceKernelGetModuleInfoFromAddr -> ESRCH");
+    return (int32_t)0x80020003; /* SCE_KERNEL_ERROR_ESRCH */
+}
+/* ---- akhir bbport-order ---- */
 /* ---- bbport-dmc: DmC Definitive Edition (Unreal Engine 3) ---- */
 /* sceKernelSetVirtualRangeName(addr, len, name): names a memory range for Sony's debug tools only;
  * nothing changes, so it is logged and succeeds. */
@@ -649,6 +700,19 @@ static ABI int32_t dmc_trophy_unlock_state(int32_t context, int32_t handle, uint
 
 static const RuntimeExport exports[]={
     /* ---- bbport-dmc ---- */
+    /* bbport-order: The Order: 1886 */
+    {"sceImeUpdate",order_ok}, {"sceImeKeyboardOpen",order_ime_kbd_open},
+    {"sceImeKeyboardGetResourceId",order_ime_kbd_resource}, {"sceImeKeyboardClose",order_ok},
+    {"sceSaveDataDialogIsReadyToDisplay",order_save_dialog_ready},
+    {"sceSaveDataDialogGetResult",order_save_dialog_result},
+    {"sceSaveDataDialogProgressBarSetValue",order_ok}, /* Close: runtime_services.c */
+    {"sceMsgDialogClose",order_ok}, {"sceMsgDialogProgressBarSetMsg",order_ok},
+    {"sceMsgDialogProgressBarSetValue",order_ok},
+    {"sceAppContentAddcontMount",order_addcont_none}, {"sceAppContentAddcontUnmount",order_addcont_none},
+    {"sceAppContentGetEntitlementKey",order_addcont_none},
+    {"sceVideoRecordingSetInfo",order_ok},
+    {"select",order_select},
+    {"sceKernelChmod",order_ok}, {"sceKernelFutimes",order_ok},
     {"sceKernelSetVirtualRangeName",kernel_set_virtual_range_name},
     {"sceKernelLoadStartModule",kernel_load_start_module},
     {"sem_init",posix_sem_init}, {"sem_destroy",posix_sem_destroy}, {"sem_wait",posix_sem_wait},

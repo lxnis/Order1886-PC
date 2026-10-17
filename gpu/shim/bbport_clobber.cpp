@@ -181,11 +181,10 @@ void AskForReport() {
     }
     std::fflush(stdout);
     std::fprintf(stderr,
-                 "\nSacredFire issue #2: the known \"clobbered dword\" bug just happened (a dword of a "
+                 "\nPort issue (clobbered dword): the known \"clobbered dword\" bug just happened (a dword of a "
                  "submitted command buffer turned into 1); the lines above are its diagnostics.\n"
-                 "SacredFire issue #2: please attach this whole log to "
-                 "https://github.com/T3CHNOLOG1C/SacredFire/issues/2 (launcher: Log page, \"Export "
-                 "log...\") so that the writer can be found and fixed.\n\n");
+                 "Port issue (clobbered dword): please keep this whole log (launcher: Log) "
+                 "so that the writer can be found and fixed.\n\n");
     std::fflush(stderr);
 }
 

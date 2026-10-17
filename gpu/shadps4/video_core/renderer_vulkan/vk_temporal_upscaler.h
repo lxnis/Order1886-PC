@@ -306,6 +306,28 @@ private:
     vk::UniqueImageView extra_sharpen_view;
     u32 extra_sharpen_width = 0, extra_sharpen_height = 0;
     vk::UniqueImageView ui_storage_view;
+
+public:
+    /// bbport-order (75): The Order: 1886's TAA (compute 92311aca) replaced by DLSS / FSR 3.1
+    /// (BB_ORDER_TAA_HOOK=dlss|fsr3). True when recorded: the game's dispatch is then skipped.
+    bool OrderTaa(VideoCore::ImageId scene, VideoCore::ImageId velocity, VideoCore::ImageId depth,
+                  VideoCore::ImageId output, float velocity_scale);
+
+private:
+    int order_mode = -1; ///< 0 off, 1 FSR 3.1, 2 DLSS
+    bool order_failed = false;
+    bool order_warned = false;
+    bool order_reset = true;
+    float order_mv = 1.0f;
+    float order_last_scale = -1.0f;
+    u32 order_w = 0, order_h = 0;
+    VideoCore::UniqueImage order_color_image, order_depth_image;
+    vk::UniqueImageView order_color_view, order_depth_view;
+    vk::UniqueDescriptorSetLayout order_prep_desc_layout, order_store_desc_layout;
+    vk::UniquePipelineLayout order_prep_pipeline_layout, order_store_pipeline_layout;
+    std::array<vk::UniquePipeline, 4> order_prep_pipelines;
+    vk::UniquePipeline order_store_pipeline;
+    std::chrono::steady_clock::time_point order_last_frame{};
 };
 
 } // namespace Vulkan

@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 #include <magic_enum/magic_enum.hpp>
+#include <atomic>
 
 #define INVALID_NUMBER_FORMAT_COMBO                                                                \
     LOG_ERROR(Render_Vulkan, "Unsupported number type {} for format {}", number_type, format);
@@ -424,8 +425,15 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
         return vk::ComponentSwizzle::eB;
     case AmdGpu::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
-    default:
-        UNREACHABLE();
+    default: {
+        // bbport-order: swizzle 2/3 tidak ada di GPU PS4; datang dari T# sampah (The Order).
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1) < 4) {
+            LOG_WARNING(Render_Vulkan, "bbport-order: swizzle tidak valid {}, pakai identity",
+                        static_cast<u32>(comp_swizzle));
+        }
+        return vk::ComponentSwizzle::eIdentity;
+    }
     }
 }
 
@@ -748,6 +756,35 @@ std::span<const SurfaceFormatInfo> SurfaceFormats() {
                                 vk::Format::eBc7UnormBlock),
         CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc7, AmdGpu::NumberFormat::Srgb,
                                 vk::Format::eBc7SrgbBlock),
+        // bbport-order: FMASK (metadata MSAA) dibaca shader custom resolve The Order. bbport
+        // tidak mengompresi MSAA, jadi FMASK di memori tetap hasil clear (0 = semua sampel di
+        // fragment 0): resolve memakai sampel 0 (tanpa AA, gambar benar).
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S2_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S8_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S2_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask8_S4_F4, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR8Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask16_S16_F1, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR16Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask16_S8_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR16Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask32_S16_F2, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask32_S8_F4, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask32_S8_F8, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask64_S16_F4, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32G32Uint),
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatFmask64_S16_F8, AmdGpu::NumberFormat::Uint,
+                                vk::Format::eR32G32Uint),
     };
     return formats;
 }
@@ -786,6 +823,27 @@ vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat
 
 vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+    // bbport-order: The Order memakai descriptor dengan number format yang tidak ada di tabel
+    // (mis. 5_9_9_9 + UbnormNz). Coba number format terdekat dulu; hanya kalau data format itu
+    // sama sekali tidak dikenal baru berhenti.
+    if (result == vk::Format::eUndefined && data_format != AmdGpu::DataFormat::FormatInvalid) {
+        static constexpr AmdGpu::NumberFormat fallbacks[] = {
+            AmdGpu::NumberFormat::Unorm, AmdGpu::NumberFormat::Float, AmdGpu::NumberFormat::Uint,
+            AmdGpu::NumberFormat::Snorm, AmdGpu::NumberFormat::Sint, AmdGpu::NumberFormat::Srgb};
+        for (const auto fallback : fallbacks) {
+            result = surface_format_table[GetSurfaceFormatTableIndex(data_format, fallback)];
+            if (result != vk::Format::eUndefined) {
+                static std::atomic<u32> told{0};
+                if (told.fetch_add(1) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "bbport-order: data_format={} num_format={} tidak dikenal, pakai num_format={}",
+                                static_cast<u32>(data_format), static_cast<u32>(num_format),
+                                static_cast<u32>(fallback));
+                }
+                return result;
+            }
+        }
+    }
     bool found =
         result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
     ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),

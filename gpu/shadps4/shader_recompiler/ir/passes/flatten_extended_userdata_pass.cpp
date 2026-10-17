@@ -1,9 +1,12 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
+#include <optional>
 #include <queue>
+#include <vector>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #include "common/arch.h"
@@ -26,6 +29,8 @@
 #ifdef ARCH_X86_64
 
 using namespace Xbyak::util;
+// bbport-order (35): shader yang sedang diproses, untuk log kegagalan SRT walker.
+static thread_local unsigned long long bb_order_srt_hash = 0;
 
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
@@ -485,6 +490,80 @@ static bool EmitComputeOffsetBitFieldUExtract(Xbyak::CodeGenerator& c, Xbyak::Re
     return true;
 }
 
+// bbport-order: shader The Order (yang tidak diawali s_mov vcc_hi) membawa pointer/offset
+// descriptor melewati loop. SSA membuat Phi yang trivial: semua argumen di luar kelompok Phi itu
+// adalah nilai yang sama (Braun dkk., "redundant phi SCC"). Phi seperti itu diganti nilainya;
+// Phi yang benar-benar dinamis tetap gagal seperti sebelumnya.
+static std::optional<IR::Value> ResolveTrivialPhi(IR::Inst* phi) {
+    std::vector<IR::Inst*> stack{phi};
+    std::vector<IR::Inst*> seen{phi};
+    std::optional<IR::Value> found;
+    while (!stack.empty()) {
+        IR::Inst* p = stack.back();
+        stack.pop_back();
+        for (size_t i = 0; i < p->NumArgs(); ++i) {
+            const IR::Value arg = p->Arg(i);
+            if (arg.IsEmpty()) {
+                continue;
+            }
+            if (!arg.IsImmediate() && arg.Inst()->GetOpcode() == IR::Opcode::Phi) {
+                IR::Inst* q = arg.Inst();
+                if (std::ranges::find(seen, q) == seen.end()) {
+                    if (seen.size() >= 64) {
+                        return std::nullopt;
+                    }
+                    seen.push_back(q);
+                    stack.push_back(q);
+                }
+                continue;
+            }
+            if (!found) {
+                found = arg;
+            } else if (!(*found == arg)) {
+                return std::nullopt;
+            }
+        }
+    }
+    return found;
+}
+
+// bbport-order (28): BB_ORDER_PHI_INIT=1 -> Phi dinamis memakai argumen immediate pertamanya
+// (nilai awal loop, mis. i = 0). Bawaan mati.
+static bool BbOrderPhiInit() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_ORDER_PHI_INIT");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+static std::optional<u32> PhiInitialImmediate(IR::Inst* phi) {
+    std::vector<IR::Inst*> stack{phi};
+    std::vector<IR::Inst*> seen{phi};
+    while (!stack.empty()) {
+        IR::Inst* p = stack.back();
+        stack.pop_back();
+        for (size_t i = 0; i < p->NumArgs(); ++i) {
+            const IR::Value arg = p->Arg(i);
+            if (arg.IsEmpty()) {
+                continue;
+            }
+            if (arg.IsImmediate()) {
+                if (arg.Type() == IR::Type::U32) {
+                    return arg.U32();
+                }
+                continue;
+            }
+            if (arg.Inst()->GetOpcode() == IR::Opcode::Phi &&
+                std::ranges::find(seen, arg.Inst()) == seen.end() && seen.size() < 64) {
+                seen.push_back(arg.Inst());
+                stack.push_back(arg.Inst());
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     switch (inst->GetOpcode()) {
     case IR::Opcode::GetUserData:
@@ -502,6 +581,7 @@ static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     case IR::Opcode::UMin32:
     case IR::Opcode::UMax32:
     case IR::Opcode::BitFieldUExtract:
+    case IR::Opcode::Phi: // bbport-order: diikuti agar ReadConstBuffer di baliknya ikut terkumpul
         return true;
     default:
         return false;
@@ -559,6 +639,33 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
     case IR::Opcode::BitFieldUExtract:
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
+    case IR::Opcode::Phi:
+        if (const auto value = ResolveTrivialPhi(inst)) { // bbport-order
+            if (value->IsImmediate()) {
+                c.mov(reg, value->U32());
+                return true;
+            }
+            return ComputeOffset(c, reg, pass_info, *value);
+        }
+        if (BbOrderPhiInit()) { // bbport-order (28): nilai awal loop
+            if (const auto init = PhiInitialImmediate(inst)) {
+                c.mov(reg, *init);
+                return true;
+            }
+        }
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, Phi (dinamis)");
+        return false;
+    case IR::Opcode::ReadLane:
+    case IR::Opcode::ReadFirstLane: { // bbport-order (37): BB_ORDER_LANE0=1 -> indeks 0
+        static const bool lane0 = std::getenv("BB_ORDER_LANE0") != nullptr;
+        if (lane0) {
+            c.mov(reg, 0);
+            return true;
+        }
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                  magic_enum::enum_name(inst->GetOpcode()));
+        return false;
+    }
     default:
         LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
                   magic_enum::enum_name(inst->GetOpcode()));
@@ -585,6 +692,39 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
     c.pop(rdi);
 }
 
+// bbport-order: offset dinamis (indeks loop / bindless) tidak bisa dihitung di CPU. Dulu bacaan
+// itu tidak mendapat slot sehingga shader dan CPU membaca user data dword 0 = descriptor sampah
+// (tile mode 29, swizzle 2/3, image 1,6 GB, data_fmt 28 ...). Sekarang setiap bacaan seperti itu
+// (dan seluruh sub-pohonnya) mendapat slot berisi 0: T# alamat 0 = texture kosong yang sah.
+static void ZeroFillSubtree(IR::Inst* subtree, PassInfo& pass_info, Xbyak::CodeGenerator& c) {
+    PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
+    if (!use_list) {
+        return;
+    }
+    for (auto [src_off_dw, use] : *use_list) {
+        c.mov(dword[rsi + (pass_info.dst_off_dw << 2)], 0);
+        SetFlatbufOffset(use, pass_info.dst_off_dw);
+        pass_info.dst_off_dw++;
+    }
+    for (auto [src_off_dw, use] : *use_list) {
+        if (pass_info.GetUsesAsPointer(use)) {
+            ZeroFillSubtree(use, pass_info, c);
+        }
+    }
+}
+
+// bbport-order (38): kegagalan offset yang ditunda sampai semua cabang SRT selesai dikunjungi.
+struct BbOrderSrtDeferred {
+    u32 scratch_dw;
+    IR::Value off;
+    u32 dst_dw;
+};
+static thread_local std::vector<BbOrderSrtDeferred> bb_order_srt_deferred;
+static bool BbOrderSrtFixup() {
+    static const bool on = std::getenv("BB_ORDER_SRT_FIXUP") != nullptr;
+    return on;
+}
+
 static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
                          Xbyak::CodeGenerator& c) {
     if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
@@ -594,11 +734,16 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     }
 
     if (!PushPtr(c, pass_info, off_dw)) {
-        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#018x})", bb_order_srt_hash);
+        // bbport-order: PushPtr sudah mendorong rdi sebelum gagal; tanpa pop, stack walker
+        // tidak seimbang dan `ret` di akhir melompat ke alamat sampah.
+        PopPtr(c);
+        ZeroFillSubtree(subtree, pass_info, c);
         return;
     }
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
     ASSERT(use_list);
+    u32 bb_scratch_dw = 0; // bbport-order (38): slot cadangan pointer cabang ini (0 = belum)
 
     // First copy all the src data from this tree level
     // That way, all data that was contiguous in the guest SRT is also contiguous in the
@@ -610,12 +755,21 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
-                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
-                continue;
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker (shader {:#018x})", bb_order_srt_hash);
+                c.xor_(r10d, r10d); // bbport-order: slot berisi 0, bukan dword 0 user data
+                if (BbOrderSrtFixup()) { // bbport-order (38): coba lagi sesudah semua cabang
+                    if (bb_scratch_dw == 0) {
+                        bb_scratch_dw = pass_info.dst_off_dw;
+                        pass_info.dst_off_dw += 2;
+                        c.mov(qword[rsi + (bb_scratch_dw << 2)], rdi);
+                    }
+                    bb_order_srt_deferred.push_back({bb_scratch_dw, src_off_dw, pass_info.dst_off_dw});
+                }
+            } else {
+                c.shl(r10d, 2);
+                c.mov(r10d, r10d);
+                c.mov(r10d, dword[rdi + r10]);
             }
-            c.shl(r10d, 2);
-            c.mov(r10d, r10d);
-            c.mov(r10d, dword[rdi + r10]);
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
 
@@ -653,9 +807,27 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
+    bb_order_srt_deferred.clear(); // bbport-order (38)
     for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
         VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
     }
+    for (const auto& d : bb_order_srt_deferred) { // bbport-order (38): offset yang ditunda
+        c.mov(rdi, qword[rsi + (d.scratch_dw << 2)]);
+        if (ComputeOffset(c, r10d, pass_info, d.off)) {
+            c.shl(r10d, 2);
+            c.mov(r10d, r10d);
+            c.mov(r10d, dword[rdi + r10]);
+            c.mov(dword[rsi + (d.dst_dw << 2)], r10d);
+        } else {
+            LOG_ERROR(Render_Recompiler, "bbport-order (38): offset tetap gagal (shader {:#018x})",
+                      bb_order_srt_hash);
+        }
+    }
+    if (!bb_order_srt_deferred.empty()) {
+        LOG_WARNING(Render_Recompiler, "bbport-order (38): {} offset SRT ditunda (shader {:#018x})",
+                    bb_order_srt_deferred.size(), bb_order_srt_hash);
+    }
+    bb_order_srt_deferred.clear();
 
     c.ret();
     c.ready();
@@ -746,6 +918,7 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
 void FlattenExtendedUserdataPass(IR::Program& program) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
+    bb_order_srt_hash = program.info.pgm_hash; // bbport-order (35)
 
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source

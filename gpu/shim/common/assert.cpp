@@ -12,7 +12,16 @@
 // before exec; Vulkan calls failing then are not errors: this thread waits for the exec instead.
 extern "C" __attribute__((weak)) volatile int runtime_restarting; // absent in the tests
 
+// bbport-order (98): >0 selama pemilihan pipeline -> assertion jadi exception (draw dilewati)
+static thread_local int bb_order_assert_throw = 0;
+extern "C" int* BbOrderAssertThrow() {
+    return &bb_order_assert_throw;
+}
+
 void assert_fail_impl() {
+    if (bb_order_assert_throw > 0) {
+        throw std::runtime_error("bbport-order (98): assertion saat pemilihan pipeline");
+    }
     if (&runtime_restarting && runtime_restarting) {
         for (;;) {
 #ifdef _WIN32

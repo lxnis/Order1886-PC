@@ -272,7 +272,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
-    const std::string title = config->title ? config->title : "SacredFire";
+    const std::string title = config->title ? config->title : "The Order: 1886";
     const s32 width = config->width, height = config->height;
     const std::string icon = config->icon ? config->icon : "";
     g_window_thread = std::thread([title, width, height, icon] {

@@ -228,7 +228,35 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4) DIALOG(webbrowser,6) DIALOG(invitation,7)
+DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
+/* bbport-order: SaveDataDialog dengan log isi parameternya (SDK: CommonDialog base 48 byte, lalu
+ * size, mode, dispType, pointer anim/items/userMsg/sysMsg/errorCode/progBar). mode: 1 user msg,
+ * 2 system msg, 3 kode error, 4 progress bar. */
+static ABI int32_t save_init(void) { return dialog_init(2); }
+static ABI int32_t save_open(const uint8_t *p) {
+    static int told;
+    if (p && told++ < 12) {
+        const uint32_t mode=*(const uint32_t *)(p+52), disp=*(const uint32_t *)(p+56);
+        const uint32_t *sys=*(const uint32_t *const *)(p+88);
+        const int32_t *err=*(const int32_t *const *)(p+96);
+        const uint32_t *user=*(const uint32_t *const *)(p+80);
+        printf("Runtime: bbport-order SaveDataDialog mode=%u dispType=%u sysMsgType=%d errorCode=%#x userMsgButtons=%d\n",
+               mode,disp,sys ? (int)sys[0] : -1,err ? (unsigned)err[0] : 0u,user ? (int)user[0] : -1);
+    }
+    const int32_t r=dialog_open(2);
+    /* bbport-order: mode 5 = progress bar. Game menunggu RUNNING, menyimpan, lalu memanggil
+     * sceSaveDataDialogClose dan menunggu FINISHED. Langsung FINISHED membuatnya membuka ulang
+     * dialog tanpa henti (The Order: 1281 kali, save tidak pernah di-mount). */
+    if (!r && p && *(const uint32_t *)(p+52)==5) dialogs[2].status=2;
+    return r;
+}
+static ABI int32_t save_close(const void *param) {
+    (void)param;
+    if (dialogs[2].status==2) dialogs[2].status=3;
+    return 0;
+}
+static ABI int32_t save_status(void) { return dialog_status(2); }
+static ABI int32_t save_term(void) { return dialog_term(2); } DIALOG(webbrowser,6) DIALOG(invitation,7)
 /* SacredFire: the web browser and invitation dialogs close at once with a zeroed result (user
  * closed / no invitation sent); Close on the browser is accepted. */
 static ABI int32_t webbrowser_close(void) { if (!dialogs[6].initialized) return DIALOG_NOT_INITIALIZED; dialogs[6].status=3; return 0; }
@@ -600,6 +628,7 @@ static const RuntimeExport exports[]={
     {"sceNetCtlInit",netctl_init}, {"sceNetCtlTerm",netctl_term}, {"sceNetResolverAbort",resolver_abort},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceSaveDataDialogClose",save_close}, {"sceSaveDataDialogGetStatus",save_status}, /* bbport-order */
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
     {"sceNpProfileDialogGetResult",profile_result},

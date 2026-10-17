@@ -4,6 +4,10 @@
 #pragma once
 
 #include <span>
+#include <algorithm> // bbport-order (97)
+#include <atomic>
+#include <cstdio>
+#include "bbport_toggles.h" // bbport-order-win (97)
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
@@ -242,7 +246,25 @@ struct Info : InfoPersistent {
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            if (runtime_fault_recover != nullptr) { // sudah di dalam titik pulih (worker)
+                srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+                return;
+            }
+            sigjmp_buf bb_recover; // bbport-order (97): pointer sampah di user data -> 0, bukan crash
+            if (sigsetjmp(bb_recover, 0) == 0) {
+                runtime_fault_recover = &bb_recover;
+                srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+                runtime_fault_recover = nullptr;
+            } else {
+                runtime_fault_recover = nullptr;
+                std::fill(flattened_ud_buf.begin() + user_data.size(), flattened_ud_buf.end(), 0u);
+                static std::atomic<u32> bb_told{0};
+                if (bb_told.fetch_add(1) < 20) {
+                    std::printf("bbport-order (97): SRT walker shader %llx membaca pointer tidak valid -> 0\n",
+                                (unsigned long long)pgm_hash);
+                    std::fflush(stdout);
+                }
+            }
         }
     }
 

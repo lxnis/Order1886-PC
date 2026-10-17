@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -58,6 +63,89 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
         }
     }
     program.post_order_blocks = Shader::IR::PostOrder(program.blocks.front());
+}
+
+
+// bbport-order (68): BB_ORDER_EXACTVS = 1 (VS wajah) | all | hash,hash
+static int BbOrderExactMode(u64 hash) {
+    static const char* env = std::getenv("BB_ORDER_EXACTVS");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+        return 0;
+    }
+    if (env[0] == 'a') {
+        return 1;
+    }
+    static const std::vector<u64> list = [] {
+        std::vector<u64> out;
+        const char* p = (env[0] == '1' && env[1] == '\0')
+                            ? "1077f760,70b542d,e0ec7fe0,429d950d,bd739cf5,231d370b,190852fd,"
+                              "b2cc4b8f,b938dd39,a369ab85,59c67371,fd7e121b,b68b212f"
+                            : env;
+        while (*p) {
+            char* end = nullptr;
+            const u64 v = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
+            }
+            out.push_back(v);
+            p = (*end == ',') ? end + 1 : end;
+        }
+        return out;
+    }();
+    for (const u64 h : list) {
+        if (h == hash) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// bbport-order (61): waterfall loop (readlane dengan lane findLSB) dijalankan per lane.
+static void BbOrderWaterfallPass(IR::Program& program) {
+    static const int mode = [] {
+        const char* e = std::getenv("BB_ORDER_WATERFALL");
+        if (e == nullptr || e[0] == '\0') {
+            return 1;
+        }
+        if (e[0] == '0') {
+            return 0;
+        }
+        return e[0] == 'a' ? 2 : 1;
+    }();
+    if (mode == 0 || (mode == 1 && program.info.sw_stage != SwStage::Vertex)) {
+        return;
+    }
+    std::vector<IR::Inst*> lanes;
+    std::vector<IR::Inst*> firsts;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::ReadLane && !inst.Arg(1).IsImmediate()) {
+                IR::Inst* src = inst.Arg(1).Inst();
+                if (src->GetOpcode() == IR::Opcode::BallotFindLsb) {
+                    lanes.push_back(&inst);
+                }
+            } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane) {
+                firsts.push_back(&inst);
+            }
+        }
+    }
+    if (lanes.empty()) {
+        return;
+    }
+    for (IR::Inst* inst : lanes) {
+        inst->ReplaceUsesWithAndRemove(inst->Arg(0));
+    }
+    for (IR::Inst* inst : firsts) {
+        inst->ReplaceUsesWithAndRemove(inst->Arg(0));
+    }
+    static std::mutex m;
+    static std::unordered_set<u64> told;
+    std::scoped_lock lock{m};
+    if (told.insert(program.info.pgm_hash).second) {
+        std::printf("bbport-order (61): waterfall per lane di shader %llx (%zu readlane, %zu readfirstlane)\n",
+                    (unsigned long long)program.info.pgm_hash, lanes.size(), firsts.size());
+        std::fflush(stdout);
+    }
 }
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
@@ -143,7 +231,20 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     if (info.sw_stage == SwStage::Fragment && profile.needs_integer_interpolation_fix) {
         Shader::Optimization::InterpolatedIntegerPass(program);
     }
+    BbOrderWaterfallPass(program); // bbport-order (61)
+    Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
+    // bbport-order (68): VS eksak -> tipe/kemampuan fp64 dipasang untuk emitter
+    if (info.sw_stage == SwStage::Vertex && profile.support_float64 && BbOrderExactMode(info.pgm_hash)) {
+        info.uses_fp64 = true;
+        static std::mutex m68;
+        static std::unordered_set<u64> told68;
+        std::scoped_lock lock68{m68};
+        if (told68.insert(info.pgm_hash).second) {
+            std::printf("bbport-order (68): VS %llx posisi eksak (fp64)\n", (unsigned long long)info.pgm_hash);
+            std::fflush(stdout);
+        }
+    }
     Shader::IR::DumpProgram(program, info);
 
     return program;

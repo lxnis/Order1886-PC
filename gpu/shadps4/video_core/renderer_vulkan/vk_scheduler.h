@@ -643,7 +643,15 @@ public:
         }
         first = last = nullptr;
         used = 0;
+        big.clear(); // bbport-order (73)
     }
+
+    /// bbport-order (73): data of a command too large for the chunk, freed with the chunk.
+    void* AllocateBig(size_t bytes) {
+        big.push_back(std::make_unique<std::byte[]>(bytes + 16));
+        return big.back().get();
+    }
+    std::vector<std::unique_ptr<std::byte[]>> big;
 
     [[nodiscard]] bool Empty() const noexcept {
         return first == nullptr;
@@ -820,6 +828,7 @@ public:
             const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
+        bb_record_oversized = false; // bbport-order (73)
     }
 
     /// bbport: Record() for a draw, dispatch or pass that runs shaders, between GPU breadcrumbs
@@ -867,7 +876,16 @@ public:
         if (!IsRecordingDeferred()) {
             return;
         }
-        ASSERT(bytes + 1024 <= RecordChunk::Capacity);
+        if (bytes + 1024 > RecordChunk::Capacity) { // bbport-order (73): larger than a chunk
+            if (CurrentChunk().Size() > 0) {
+                RetireChunk();
+            }
+            bb_record_oversized = true;
+            return;
+        }
+        if (bb_record_oversized) {
+            return;
+        }
         if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 1024) {
             RetireChunk();
         }
@@ -884,7 +902,15 @@ public:
         // Room for the data and the command that follows it, so both stay in one chunk.
         const size_t bytes = data.size_bytes();
         ReserveRecordData(bytes + alignof(T));
-        auto* dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
+        T* dst = nullptr;
+        // bbport-order (73): what does not fit (with 1 KiB left for the command) goes to a block
+        // owned by the same chunk.
+        if (RecordChunk::Capacity - CurrentChunk().Size() >= bytes + alignof(T) + 1024) {
+            dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
+        }
+        if (dst == nullptr) {
+            dst = static_cast<T*>(CurrentChunk().AllocateBig(bytes));
+        }
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
     }
@@ -1157,6 +1183,7 @@ private:
     std::vector<std::unique_ptr<SubmissionBatch>> all_batches;
     std::vector<SubmissionBatch*> free_batches; ///< guarded by recorder_mutex
     bool async_submit = false; ///< BB_ASYNC_SUBMIT (default on)
+    bool bb_record_oversized = false; ///< bbport-order (73): ReserveRecordData > chunk
     std::atomic<u64> submitted_tick{0}; ///< the last tick handed to the queue (WaitSubmitted)
     u32 current_segment = 0;
     std::atomic<u32> active_worker{0}; ///< the worker of current_segment (it spins for work)

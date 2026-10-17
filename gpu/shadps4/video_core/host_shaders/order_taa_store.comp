@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport-order (75): the DLSS / FSR 3.1 result into the output of The Order's TAA (alpha 1).
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform readonly image2D upscaled;
+layout(binding = 1, rgba16f) uniform writeonly image2D target;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, imageSize(target)))) {
+        return;
+    }
+    imageStore(target, p, vec4(max(imageLoad(upscaled, p).rgb, vec3(0.0)), 1.0));
+}

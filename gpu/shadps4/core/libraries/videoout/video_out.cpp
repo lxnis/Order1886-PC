@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -140,7 +142,19 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    // bbport-order (67): catat permintaan game; BB_ORDER_FLIPRATE=0|1|2 memaksa nilainya.
+    static const int forced = [] {
+        const char* e = std::getenv("BB_ORDER_FLIPRATE");
+        return (e != nullptr && e[0] >= '0' && e[0] <= '2') ? e[0] - '0' : -1;
+    }();
+    static int last = -100;
+    if (rate != last) {
+        last = rate;
+        std::printf("bbport-order (67): game SetFlipRate(%d)%s\n", rate,
+                    forced >= 0 ? " -> dipaksa BB_ORDER_FLIPRATE" : "");
+        std::fflush(stdout);
+    }
+    driver->GetPort(handle)->flip_rate = forced >= 0 ? forced : rate;
     return ORBIS_OK;
 }
 

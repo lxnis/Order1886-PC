@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -80,6 +81,15 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     return result;
 }
 
+// bbport-order (51): BaryCoordKHR = (b0, b1, b2); GCN I/J = bobot verteks 1/2 -> komponen comp + 1.
+static u32 BbOrderBaryComp(const EmitContext& ctx, u32 comp) {
+    static const bool fix = [] { // bawaan MATI: dengan ini layar rusak total (16 Okt 23:21)
+        const char* e = std::getenv("BB_ORDER_BARYFIX");
+        return e != nullptr && e[0] == '1';
+    }();
+    return (fix && !ctx.profile.supports_amd_shader_explicit_vertex_parameter) ? comp + 1 : comp;
+}
+
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
     if (IR::IsParam(attr)) {
         const u32 param_index{u32(attr) - u32(IR::Attribute::Param0)};
@@ -147,7 +157,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
             return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
                                                             ctx.ConstU32(comp)));
         } else {
-            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord),
+                                          BbOrderBaryComp(ctx, comp)); // bbport-order (51)
         }
     case IR::Attribute::BaryCoordSmoothCentroid:
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
@@ -156,7 +167,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                                                 ctx.ConstU32(comp)));
         } else {
             return ctx.OpCompositeExtract(
-                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord), comp);
+                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord),
+                BbOrderBaryComp(ctx, comp)); // bbport-order (51)
         }
     case IR::Attribute::BaryCoordSmoothSample:
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
@@ -168,15 +180,16 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                 ctx.F32[1],
                 ctx.OpInterpolateAtSample(ctx.F32[3], ctx.bary_coord,
                                           ctx.OpLoad(ctx.U32[1], ctx.sample_index)),
-                comp);
+                BbOrderBaryComp(ctx, comp)); // bbport-order (51)
         }
     case IR::Attribute::BaryCoordNoPersp:
         return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp,
-                                                        ctx.ConstU32(comp)));
+                                                        ctx.ConstU32(BbOrderBaryComp(ctx, comp)))); // bbport-order (51)
     case IR::Attribute::BaryCoordNoPerspSample:
         return ctx.OpLoad(
             ctx.F32[1],
-            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp_sample, ctx.ConstU32(comp)));
+            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp_sample,
+                              ctx.ConstU32(BbOrderBaryComp(ctx, comp)))); // bbport-order (51)
     case IR::Attribute::BaryCoordPullModel: {
         ASSERT_MSG(comp < 3, "Invalid BaryCoordPullModel component {}", comp);
 
