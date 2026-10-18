@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdio> // bbport-order (106)
+
 #include "common/assert.h"
 #include "common/types.h"
 
@@ -289,13 +291,31 @@ constexpr std::array macro_tile_extents_alt{
 constexpr std::pair micro_tile_extent{8u, 8u};
 constexpr auto hw_pipe_interleave = 256u;
 
+inline bool bb_order_mt_told = false; // bbport-order (106)
+
 constexpr std::pair<u32, u32> GetMacroTileExtents(AmdGpu::TileMode tile_mode, u32 bpp,
                                                   u32 num_samples, bool alt) {
-    ASSERT(num_samples <= 8);
+    // bbport-order (106): T# sampah (num_samples > 8, bpp/tile mode di luar tabel) -> nilai aman, bukan ASSERT
+    const bool bb_bad_samples = num_samples == 0 || num_samples > 8;
+    if (bb_bad_samples) {
+        num_samples = 1;
+    }
     const auto samples_log = static_cast<u32>(std::log2(num_samples));
     const auto row = u32(tile_mode) * 5;
     const auto column = std::bit_width(bpp) - 4; // bpps are 8, 16, 32, 64, 128
-    return (alt ? macro_tile_extents_alt : macro_tile_extents)[samples_log][row + column];
+    const auto& bb_table = (alt ? macro_tile_extents_alt : macro_tile_extents)[samples_log];
+    const u32 bb_index = row + u32(column);
+    if (bb_bad_samples || bpp < 8 || bpp > 128 || bb_index >= bb_table.size()) {
+        if (!bb_order_mt_told) {
+            bb_order_mt_told = true;
+            std::fprintf(stderr, "bbport-order (106): T# tidak valid di GetMacroTileExtents (tile %u, bpp %u)\n",
+                         u32(tile_mode), bpp);
+        }
+        if (bpp < 8 || bpp > 128 || bb_index >= bb_table.size()) {
+            return {128u, 64u};
+        }
+    }
+    return bb_table[bb_index];
 }
 
 constexpr std::tuple<u32, u32, size_t> ImageSizeLinearAligned(u32 pitch, u32 height, u32 bpp,
