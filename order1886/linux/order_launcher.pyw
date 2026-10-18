@@ -83,9 +83,9 @@ def clean_env():
 KNOWN_IDS = {'CUSA00035': 'CUSA00035', 'CUSA00076': 'CUSA00076 (EU)'}
 FPS = ['30', '60']                       # 60 = maximum (above it the game logic breaks: QTE mash)
 RES = {'1080p (native)': 'native', '2K (2560x1440)': '2560x1440', '4K (3840x2160)': '3840x2160'}
-# Upscaler / AA in place of the game's own TAA (compute 92311aca, order_patch.py section 75):
-# DLAA / FSR 3.1 Native AA at the game's render resolution (1080p, 2K or 4K).
-UPSCALER = {'Native (game TAA)': 'off', 'DLSS (DLAA, NVIDIA RTX)': 'dlss', 'FSR 3.1 (Native AA)': 'fsr3'}
+# Anti-aliasing: always the game's own TAA, MSAA off (BB_ORDER_NO_MSAA=1, section 49). The upscaler
+# hook (DLSS/FSR 3.1 in place of TAA, section 75) and MSAA 4x are no longer offered (18 Oct): lighter,
+# simpler. Extra env BB_ORDER_TAA_HOOK=dlss|fsr3 or BB_ORDER_NO_MSAA=0 still work for testing.
 # CPU usage of the port (17 Oct, i3-12100F): Fast = parallel recording + the game's job workers
 # sleep when idle (order_patch.py 73/74, order_patches.py --spin): ~80 FPS in game instead of ~60.
 PERF = ('Fast (parallel, 80+ FPS)', 'Safe (serial, ~60 FPS)')
@@ -93,9 +93,6 @@ FAST_ENV = {'BB_VK_RECORD_THREAD': '1', 'BB_VK_RECORD_THREADS': '3', 'BB_PREP_WO
             'BB_ASYNC_SUBMIT': '0', 'BB_ASYNC_FENCES': '0', 'BB_ORDER_YIELD_US': '50'}
 FAST_SPIN = '64'
 
-# Anti-aliasing of the game itself: TAA + MSAA 4x (scene color). MSAA off = section 49
-# (BB_ORDER_NO_MSAA=1): lighter, edges a little softer/jaggier.
-AA = {'Game (TAA + MSAA)': '0', 'Game TAA, MSAA off': '1'}
 ANISO = {'Game': '0', '4x': '4', '8x': '8', '16x': '16'}
 DISPLAY = ('Fullscreen', 'Windowed')   # BB_FULLSCREEN=1/0 (window.cpp, SDL)
 
@@ -208,21 +205,15 @@ class Launcher:
         perf = self.conf.get('performance')
         self.v_perf = tk.StringVar(value=perf if perf in PERF else PERF[0])
         self.v_env = tk.StringVar(value=self.conf.get('extra_env', ''))
-        up = self.conf.get('upscaler')
-        self.v_up = tk.StringVar(value=up if up in UPSCALER else 'Native (game TAA)')
-        aa = self.conf.get('antialiasing')
-        self.v_aa = tk.StringVar(value=aa if aa in AA else 'Game (TAA + MSAA)')
         af = self.conf.get('anisotropic')
         self.v_af = tk.StringVar(value=af if af in ANISO else 'Game')
         combo(1, 'FPS', self.v_fps, FPS)
         self.c_res = combo(2, 'Resolution', self.v_res, list(RES))
-        combo(3, 'Upscaler', self.v_up, list(UPSCALER))
-        combo(4, 'Anti-aliasing', self.v_aa, list(AA))
-        combo(5, 'Anisotropic', self.v_af, list(ANISO))
+        combo(3, 'Anisotropic', self.v_af, list(ANISO))
         mode = self.conf.get('display')
         self.v_mode = tk.StringVar(value=mode if mode in DISPLAY else 'Fullscreen')
-        combo(6, 'Display', self.v_mode, list(DISPLAY))
-        combo(7, 'Performance', self.v_perf, list(PERF))
+        combo(4, 'Display', self.v_mode, list(DISPLAY))
+        combo(5, 'Performance', self.v_perf, list(PERF))
         checks = (('16:9 full screen (no black bars) (supports 2K and 4K)', self.v_aspect),
                   ('Compile shaders in the background (less stutter)', self.v_async),
                   ('Face dot fix', self.v_facefix),
@@ -230,14 +221,14 @@ class Launcher:
                   ('Frame statistics in the log', self.v_stats))
         for i, (text, var) in enumerate(checks):
             ttk.Checkbutton(opts, text=text, variable=var, command=self.changed,
-                            style='Panel.TCheckbutton').grid(row=8 + i, column=0, columnspan=2,
+                            style='Panel.TCheckbutton').grid(row=6 + i, column=0, columnspan=2,
                                                              sticky='w', pady=(8 if i == 0 else 2, 0))
-        ttk.Label(opts, text='Extra env', style='Panel.TLabel').grid(row=13, column=0, sticky='w', pady=(10, 0))
+        ttk.Label(opts, text='Extra env', style='Panel.TLabel').grid(row=11, column=0, sticky='w', pady=(10, 0))
         e = ttk.Entry(opts, textvariable=self.v_env, width=36)
-        e.grid(row=13, column=1, sticky='e', pady=(10, 0))
+        e.grid(row=11, column=1, sticky='e', pady=(10, 0))
         e.bind('<FocusOut>', lambda ev: self.changed())
         self.lbl_note = ttk.Label(opts, style='Note.TLabel', wraplength=560, justify='left')
-        self.lbl_note.grid(row=14, column=0, columnspan=2, sticky='w', pady=(10, 0))
+        self.lbl_note.grid(row=12, column=0, columnspan=2, sticky='w', pady=(10, 0))
 
         buttons = ttk.Frame(f)
         buttons.pack(fill='x')
@@ -295,8 +286,9 @@ class Launcher:
         return read_sfo(g).get('TITLE_ID', '') if g else ''
 
     def save(self):
-        self.conf.update(fps=self.v_fps.get(), resolution=self.v_res.get(), upscaler=self.v_up.get(),
-                         antialiasing=self.v_aa.get(), anisotropic=self.v_af.get(),
+        for old in ('upscaler', 'antialiasing'):   # options removed 18 Oct
+            self.conf.pop(old, None)
+        self.conf.update(fps=self.v_fps.get(), resolution=self.v_res.get(), anisotropic=self.v_af.get(),
                          display=self.v_mode.get(),
                          aspect169=self.v_aspect.get(), async_pipelines=self.v_async.get(),
                          facefix=self.v_facefix.get(), frame_stats=self.v_stats.get(),
@@ -339,11 +331,6 @@ class Launcher:
         elif tid != 'CUSA00035':
             note = (f'{tid}: the FPS/resolution patches were made for CUSA00035 v01.02. If they do not '
                     'match this eboot the game runs unpatched (30 FPS, 1080p).')
-        elif UPSCALER[self.v_up.get()] != 'off':
-            note = (f'{self.v_up.get()}: replaces the game TAA (new - report ghosting or smearing). '
-                    'If it cannot run, the log says why and the game TAA stays.')
-            if UPSCALER[self.v_up.get()] == 'dlss' and not (PROBE.parent / 'libbbport_dlss.so').exists():
-                note += ' DLSS files are missing: FSR 3.1 is used instead.'
         elif self.v_fps.get() != '30':
             note = 'Above 30 FPS: QTE softlock in chapters 6 and 9 (community note) - play those at 30.'
         self.lbl_note.configure(text=note)
@@ -495,17 +482,14 @@ class Launcher:
         # port ignores that (order_patch.py section 67). Extra env BB_ORDER_FLIPRATE=1 = the game's.
         if fps != '30':
             env['BB_ORDER_FLIPRATE'] = '0'
-        # bbport's own upscaler path is Bloodborne's (jitter + compute 9a9cf8a9): kept off. The Order's
-        # hook (in place of its TAA 92311aca) reads BB_ORDER_TAA_HOOK=dlss|fsr3.
+        # bbport's own upscaler path is Bloodborne's (jitter + compute 9a9cf8a9): kept off. The game's
+        # own TAA does the anti-aliasing (no TAA hook), MSAA off.
         env['BB_UPSCALER'] = 'off'
         env['BB_ANISO'] = ANISO[self.v_af.get()]
         env['BB_FULLSCREEN'] = '1' if self.v_mode.get() == 'Fullscreen' else '0'
-        if AA[self.v_aa.get()] == '1':
-            env['BB_ORDER_NO_MSAA'] = '1'
+        env['BB_ORDER_NO_MSAA'] = '1'
         env['BB_ASYNC_PIPELINES'] = '1' if self.v_async.get() else '0'
         env['BB_ORDER_FACEFIX'] = '1' if self.v_facefix.get() else '0'
-        if UPSCALER[self.v_up.get()] != 'off':
-            env['BB_ORDER_TAA_HOOK'] = UPSCALER[self.v_up.get()]
         if self.v_stats.get():
             env['BB_FRAME_STATS'] = '1'
         # Extra env: KEY=VALUE pairs separated by spaces (e.g. BB_ORDER_FULLBARRIER=1).

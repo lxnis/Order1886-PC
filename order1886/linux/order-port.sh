@@ -14,7 +14,7 @@ KERJA=$HOME/PS41886
 BBPORT=$PROJECT/bbport
 GAME=$HOME/PS4/CUSA00035
 OUT=$KERJA/out
-USERDIR=$KERJA/user
+USERDIR=${ORDER_USER:-$KERJA/user}   # ORDER_USER=folder lain (mis. save AppImage ~/.local/share/order1886/user)
 LOG=$KERJA/order_play.log
 
 # Awal: sama dengan pengaturan aman DmC (serial recording, tanpa upscaler, filter asli game).
@@ -83,7 +83,7 @@ grep -E '^Patches:|^STOP|^API|Guest fault|Host fault|Fault \(signal|NULL call|Sh
 echo "-- statistik frame (BB_FRAME_STATS=1), 10 terakhir:"
 grep -iE 'frame stats|fps|pipelines compiled' "$LOG" | grep -v flipmode | tail -10
 echo "-- pesan GPU terbanyak:"
-grep -E '^GPU \[' "$LOG" | sed -E 's/0x[0-9a-f]+/X/g; s/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -6
+grep -E '^GPU \[' "$LOG" | sed -E 's/0x[0-9a-f]+/X$HOME; s/[0-9]+/N$HOME' | sort | uniq -c | sort -rn | head -6
 echo "-- 15 baris terakhir log (tanpa spam recompiler/flip):"
 grep -vE 'SRT walker|flipmode|direct allocation|mapped direct' "$LOG" | tail -15
 exit $status

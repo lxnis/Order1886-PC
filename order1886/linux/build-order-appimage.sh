@@ -157,7 +157,7 @@ TOOL=$WORK/appimagetool-x86_64.AppImage
 [[ -x $TOOL ]] || { [[ -x $PROJECT/appimage/appimagetool-x86_64.AppImage ]] && cp "$PROJECT/appimage/appimagetool-x86_64.AppImage" "$TOOL"; }
 if [[ ! -x $TOOL ]]; then
     say "Downloading appimagetool"
-    curl -fL -o "$TOOL" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+    curl -fL -o "$TOOL" https:/$HOMEithub.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
     chmod +x "$TOOL"
 fi
 say "Packing $OUT"
