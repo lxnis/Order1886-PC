@@ -51,9 +51,9 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 FPS = ['30', '60']        # 60 = maximum (above it the game logic breaks; QTE in chapters 6/9: use 30)
 RES = {'1080p (native)': 'native', '2K (2560x1440)': '2560x1440', '4K (3840x2160)': '3840x2160'}
-# In place of the game's TAA (compute 92311aca, order_patch.py 75). DLSS: Linux only for now.
-UPSCALER = {'Native (game TAA)': 'off', 'FSR 3.1 (Native AA)': 'fsr3'}
-AA = {'Game (TAA + MSAA)': '0', 'Game TAA, MSAA off': '1'}
+# Anti-aliasing: always the game's own TAA, MSAA off (BB_ORDER_NO_MSAA=1, section 49). The upscaler
+# hook (FSR 3.1 in place of TAA, section 75) and MSAA 4x are no longer offered (19 Oct): lighter,
+# simpler. Extra env BB_ORDER_TAA_HOOK=fsr3 or BB_ORDER_NO_MSAA=0 still work for testing.
 ANISO = {'Game': '0', '4x': '4', '8x': '8', '16x': '16'}
 PRESENT = {'Mailbox': 'Mailbox', 'VSync': 'Fifo', 'Immediate': 'Immediate'}
 DISPLAY = ('Fullscreen', 'Windowed')
@@ -171,8 +171,6 @@ class Launcher:
         pick = lambda key, table, default: tk.StringVar(value=c.get(key) if c.get(key) in table else default)
         self.v_fps = pick('fps', FPS, '60')
         self.v_res = pick('resolution', RES, '1080p (native)')
-        self.v_up = pick('upscaler', UPSCALER, 'Native (game TAA)')
-        self.v_aa = pick('antialiasing', AA, 'Game (TAA + MSAA)')
         self.v_af = pick('anisotropic', ANISO, 'Game')
         self.v_present = pick('present', PRESENT, 'Mailbox')
         self.v_mode = pick('display', DISPLAY, 'Fullscreen')
@@ -184,26 +182,24 @@ class Launcher:
         self.v_env = tk.StringVar(value=c.get('extra_env', ''))
         combo(1, 'FPS', self.v_fps, FPS)
         self.c_res = combo(2, 'Resolution', self.v_res, list(RES))
-        combo(3, 'Upscaler', self.v_up, list(UPSCALER))
-        combo(4, 'Anti-aliasing', self.v_aa, list(AA))
-        combo(5, 'Anisotropic', self.v_af, list(ANISO))
-        combo(6, 'Present mode', self.v_present, list(PRESENT))
-        combo(7, 'Display', self.v_mode, list(DISPLAY))
-        combo(8, 'Performance', self.v_perf, list(PERF))
+        combo(3, 'Anisotropic', self.v_af, list(ANISO))
+        combo(4, 'Present mode', self.v_present, list(PRESENT))
+        combo(5, 'Display', self.v_mode, list(DISPLAY))
+        combo(6, 'Performance', self.v_perf, list(PERF))
         checks = (('16:9 full screen (no black bars) (supports 2K and 4K)', self.v_aspect),
                   ('Compile shaders in the background (less stutter)', self.v_async),
                   ('Face dot fix', self.v_facefix),
                   ('FPS counter in game', self.v_showfps))
         for i, (text, var) in enumerate(checks):
             ttk.Checkbutton(opts, text=text, variable=var, command=self.changed,
-                            style='Panel.TCheckbutton').grid(row=9 + i, column=0, columnspan=2,
+                            style='Panel.TCheckbutton').grid(row=7 + i, column=0, columnspan=2,
                                                              sticky='w', pady=(6 if i == 0 else 1, 0))
-        ttk.Label(opts, text='Extra env', style='Panel.TLabel').grid(row=13, column=0, sticky='w', pady=(8, 0))
+        ttk.Label(opts, text='Extra env', style='Panel.TLabel').grid(row=11, column=0, sticky='w', pady=(8, 0))
         e = ttk.Entry(opts, textvariable=self.v_env, width=30)
-        e.grid(row=13, column=1, sticky='e', pady=(8, 0))
+        e.grid(row=11, column=1, sticky='e', pady=(8, 0))
         e.bind('<FocusOut>', lambda ev: self.changed())
         self.lbl_note = ttk.Label(opts, style='Note.TLabel', wraplength=420, justify='left')
-        self.lbl_note.grid(row=14, column=0, columnspan=2, sticky='w', pady=(8, 0))
+        self.lbl_note.grid(row=12, column=0, columnspan=2, sticky='w', pady=(8, 0))
 
         buttons = ttk.Frame(f)
         buttons.pack(fill='x')
@@ -255,8 +251,9 @@ class Launcher:
         return Path(g) if g else None
 
     def save(self):
-        self.conf.update(fps=self.v_fps.get(), resolution=self.v_res.get(), upscaler=self.v_up.get(),
-                         antialiasing=self.v_aa.get(), anisotropic=self.v_af.get(),
+        for old in ('upscaler', 'antialiasing'):   # options removed 19 Oct
+            self.conf.pop(old, None)
+        self.conf.update(fps=self.v_fps.get(), resolution=self.v_res.get(), anisotropic=self.v_af.get(),
                          present=self.v_present.get(), display=self.v_mode.get(),
                          performance=self.v_perf.get(), aspect169=self.v_aspect.get(),
                          async_pipelines=self.v_async.get(), facefix=self.v_facefix.get(),
@@ -404,12 +401,9 @@ class Launcher:
         env['BB_ANISO'] = ANISO[self.v_af.get()]
         env['BB_PRESENT_MODE'] = PRESENT[self.v_present.get()]
         env['BB_FULLSCREEN'] = '1' if self.v_mode.get() == 'Fullscreen' else '0'
-        if AA[self.v_aa.get()] == '1':
-            env['BB_ORDER_NO_MSAA'] = '1'
+        env['BB_ORDER_NO_MSAA'] = '1'
         env['BB_ASYNC_PIPELINES'] = '1' if self.v_async.get() else '0'
         env['BB_ORDER_FACEFIX'] = '1' if self.v_facefix.get() else '0'
-        if UPSCALER[self.v_up.get()] != 'off':
-            env['BB_ORDER_TAA_HOOK'] = UPSCALER[self.v_up.get()]
         for pair in self.extra_pairs():
             if '=' in pair:
                 k, v = pair.split('=', 1)

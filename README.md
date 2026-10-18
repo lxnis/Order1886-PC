@@ -1,3 +1,7 @@
+<!-- order1886 -->
+> **This branch (`order1886-win`) is a native Windows port of The Order: 1886 (PS4, CUSA00035).**
+> See [order1886/README.md](order1886/README.md) for download, status and build steps. The text below is the README of the CTR-NitroFueled-PC project it is built on.
+
 # The Order: 1886 — native PC port (Windows)
 
 An experimental native Windows port of **The Order: 1886** (PS4, CUSA00035, update 01.02). The

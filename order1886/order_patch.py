@@ -6163,6 +6163,324 @@ def bad_shader_helper_order():
     write(pcp, pt)
     print('99. helper bagian 98 dipindah ke sebelum RefreshGraphicsKey (build error)')
 
+# --- 100. Langit/kabut dan gedung jauh berkedip = bias face fix di semua draw (18 Okt 22:50) ---
+# Video 22:40 (alun-alun Whitechapel, bar hitam 2.4:1, Fast): langit dan gedung jauh berganti terang/
+# gelap tiap 1-8 frame (luma 126 <-> 146). Selisihnya = cahaya kabut/matahari yang makin kuat untuk
+# objek makin jauh (langit +32%, gedung jauh +31%, gedung dekat dan Galahad 0%). Tes 22:49: face fix
+# mati -> langit normal. Sejak bagian 95 bias 256 berlaku untuk SEMUA draw LESS/LEQUAL tanpa tulis
+# depth, termasuk pass kabut; di kejauhan bias itu = jarak dunia besar, dan dengan jitter TAA hasilnya
+# bergantian. Sekarang bawaan kembali ke daftar shader bagian 94: hanya pixel shader kulit f5c17eec
+# (BB_ORDER_FACEFIX_PS) atau vertex shader di BB_ORDER_FACEFIX_VS. BB_ORDER_FACEFIX_VS=all = perilaku 95.
+SKY_ALL_OLD = ("        if (e == nullptr || e[0] == '\\0' || e[0] == 'a' || e[0] == 'A') { // bbport-order (95): bawaan semua\n"
+               "            l.all = true;\n        }\n")
+SKY_ALL_NEW = ("        if (e != nullptr && (e[0] == 'a' || e[0] == 'A')) { // bbport-order (100): bawaan hanya daftar shader\n"
+               "            l.all = true;\n        }\n")
+
+
+def face_fix_skin_only():
+    rz = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'renderer_vulkan' / 'vk_rasterizer.cpp'
+    rt = read(rz)
+    if 'bbport-order (100)' in rt:
+        print('100. face fix hanya shader kulit (langit tidak kedip): sudah dipatch')
+        return
+    if rt.count(SKY_ALL_OLD) != 1:
+        sys.exit('bagian 100: titik sisip bagian 95 tidak ditemukan di vk_rasterizer.cpp')
+    write(rz, rt.replace(SKY_ALL_OLD, SKY_ALL_NEW, 1))
+    print('100. face fix hanya pixel shader kulit f5c17eec (langit/kabut kedip); BB_ORDER_FACEFIX_VS=all = lama')
+
+# --- 101. Bintik wajah kembali dengan 100: pilih draw menurut MRT, bukan hanya hash f5c17eec (18 Okt 23:00) ---
+# Tes 22:57: dengan 100 langit normal, tapi bintik wajah kembali -> wajah di adegan itu memakai pixel
+# shader kulit lain. Pass kulit menulis 2 MRT (cahaya kulit untuk blur subsurface, bagian 39/59);
+# pass kabut/langit menulis 1 target. Bawaan sekarang (BB_ORDER_FACEFIX_SEL=mrt): bias untuk draw
+# tanpa tulis depth yang (a) pixel shader-nya di daftar 94 / vertex shader di daftar 93, ATAU (b) menulis
+# 2+ target warna. skin = hanya daftar (bagian 100), all = semua draw (bagian 95).
+# Diagnosa: setiap pixel shader yang kena bias dicatat sekali di log ("101: bias ps ... mrt ..."),
+# maksimal 256, supaya shader kabut/kulit bisa dibedakan bila masih salah.
+SEL_ANCHOR = "static bool BbOrderFaceFixVsOk() {\n"
+SEL_FUNC = r"""// bbport-order (101): pilihan draw untuk face bias (BB_ORDER_FACEFIX_SEL=mrt|skin|all)
+static bool BbOrderFaceFixVsOk();
+static bool BbOrderFaceFixSelOk(bool mrt) {
+    static const int sel = [] {
+        const char* e = std::getenv("BB_ORDER_FACEFIX_SEL");
+        const int v = (e != nullptr && e[0] == 's') ? 1 : (e != nullptr && e[0] == 'a') ? 2 : 0;
+        std::printf("bbport-order (101): face fix memilih draw: %s\n",
+                    v == 1 ? "skin (daftar shader)" : v == 2 ? "all (semua draw)" : "mrt (daftar shader + 2+ target)");
+        std::fflush(stdout);
+        return v;
+    }();
+    const bool ok = sel == 2 || BbOrderFaceFixVsOk() || (sel == 0 && mrt);
+    if (ok) {
+        static std::atomic<u64> seen[512]{};
+        static std::atomic<u32> logged{0};
+        const u64 key = (bb_order_ff_ps << 1) | (mrt ? 1u : 0u);
+        if (key != 0 && logged.load(std::memory_order_relaxed) < 256) {
+            u32 i = u32((key * 0x9E3779B97F4A7C15ull) >> 55) & 511u;
+            for (u32 n = 0; n < 512; ++n, i = (i + 1) & 511u) {
+                u64 cur = seen[i].load(std::memory_order_relaxed);
+                if (cur == key) {
+                    break;
+                }
+                if (cur == 0 && seen[i].compare_exchange_strong(cur, key)) {
+                    logged.fetch_add(1, std::memory_order_relaxed);
+                    std::printf("bbport-order (101): bias ps %llx vs %llx mrt %d\n",
+                                (unsigned long long)bb_order_ff_ps, (unsigned long long)bb_order_ff_vs,
+                                mrt ? 1 : 0);
+                    std::fflush(stdout);
+                    break;
+                }
+                if (cur == key) {
+                    break;
+                }
+            }
+        }
+    }
+    return ok;
+}
+"""
+HIT_OLD = ("                       : (bb_ff == 1 && !bb_ff_writes && regs.color_buffers[0] && BbOrderFaceFixVsOk() &&\n"
+           "                          (regs.depth_control.depth_func != AmdGpu::CompareFunc::Equal ||\n"
+           "                           BbOrderFaceFixEqualOk())); // (93/95)\n")
+HIT_NEW = ("                       : (bb_ff == 1 && !bb_ff_writes && regs.color_buffers[0] &&\n"
+           "                          (regs.depth_control.depth_func != AmdGpu::CompareFunc::Equal ||\n"
+           "                           BbOrderFaceFixEqualOk()) &&\n"
+           "                          BbOrderFaceFixSelOk(bool(regs.color_buffers[1]))); // (93/95/101) bbport-order (101)\n")
+
+
+def face_fix_mrt():
+    rz = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'renderer_vulkan' / 'vk_rasterizer.cpp'
+    rt = read(rz)
+    if 'bbport-order (101)' in rt:
+        print('101. face fix memilih draw menurut MRT: sudah dipatch')
+        return
+    for i, old in enumerate((SEL_ANCHOR, HIT_OLD)):
+        if rt.count(old) != 1:
+            sys.exit('bagian 101: titik sisip %d tidak ditemukan (bagian 93-95 belum terpasang?)' % i)
+    rt = rt.replace(SEL_ANCHOR, SEL_FUNC + SEL_ANCHOR, 1).replace(HIT_OLD, HIT_NEW, 1)
+    write(rz, rt)
+    print('101. face fix: shader kulit + draw 2+ target (MRT); BB_ORDER_FACEFIX_SEL=skin|all, log "101: bias ps"')
+
+# --- 102. Langit kedip lagi dengan 101 (hampir semua material The Order menulis 2 MRT): pengecualian live (18 Okt 23:30) ---
+# Tes 23:09: 101 -> bintik wajah hilang, langit/gedung jauh kedip lagi. Log 101: 217 pixel shader kena
+# bias, semuanya mrt 1 -> MRT bukan pembeda. RenderDoc terlalu lambat untuk mencari momen kedip.
+# RenderDoc frame 1420 (23:35): yang kedip bukan kabut/langit, tapi material GEDUNG di pass warna (LEQUAL,
+# tanpa tulis depth, bias -256). -256 unit depth D32 = ~0,6 mm di 2 m tapi ~1,5 m di 100 m -> permukaan
+# di belakang fasad lolos, bergantian dengan jitter TAA; kabut layar penuh (eid 21520) menimpanya.
+# Hanya 21 vertex shader di semua draw yang kena bias; kulit f5c17eec memakai vs 193274a4.
+# Sekarang: hash pixel ATAU vertex shader di BB_ORDER_FACEFIX_EXCL (daftar hex) atau di file
+# BB_ORDER_FACEFIX_EXCL_FILE (dibaca ulang tiap 0,5 detik saat main) TIDAK diberi face bias.
+EX_ANCHOR = "// bbport-order (101): pilihan draw untuk face bias (BB_ORDER_FACEFIX_SEL=mrt|skin|all)\n"
+EX_FUNC = r"""// bbport-order (102): pixel/vertex shader tanpa face bias (BB_ORDER_FACEFIX_EXCL, BB_ORDER_FACEFIX_EXCL_FILE live)
+static void BbOrderParseHexList(const char* s, std::vector<u64>& out) {
+    out.clear();
+    while (s != nullptr && *s) {
+        char* end = nullptr;
+        const u64 v = std::strtoull(s, &end, 16);
+        if (end == s) {
+            ++s;
+            continue;
+        }
+        if (v != 0) {
+            out.push_back(v);
+        }
+        s = end;
+    }
+}
+static bool BbOrderFaceFixExcluded() {
+    static std::mutex mu;
+    static std::vector<u64> base, file;
+    static long long next = 0;
+    static const char* path = std::getenv("BB_ORDER_FACEFIX_EXCL_FILE");
+    std::lock_guard<std::mutex> lk(mu);
+    static const bool init = [] {
+        BbOrderParseHexList(std::getenv("BB_ORDER_FACEFIX_EXCL"), base);
+        std::printf("bbport-order (102): face fix dikecualikan %zu shader%s%s\n", base.size(),
+                    path ? ", file live " : "", path ? path : "");
+        std::fflush(stdout);
+        return true;
+    }();
+    (void)init;
+    if (path != nullptr) {
+        const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        if (now >= next) {
+            next = now + 500;
+            std::string text;
+            if (FILE* f = std::fopen(path, "r")) {
+                char buf[4096];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0 && text.size() < (1u << 20)) {
+                    text.append(buf, n);
+                }
+                std::fclose(f);
+            }
+            std::vector<u64> fresh;
+            BbOrderParseHexList(text.c_str(), fresh);
+            if (fresh != file) {
+                file.swap(fresh);
+                std::printf("bbport-order (102): file pengecualian: %zu shader\n", file.size());
+                std::fflush(stdout);
+            }
+        }
+    }
+    for (const u64 h : base) {
+        if (h == bb_order_ff_ps || h == bb_order_ff_vs) {
+            return true;
+        }
+    }
+    for (const u64 h : file) {
+        if (h == bb_order_ff_ps || h == bb_order_ff_vs) {
+            return true;
+        }
+    }
+    return false;
+}
+"""
+OK_OLD = "    const bool ok = sel == 2 || BbOrderFaceFixVsOk() || (sel == 0 && mrt);\n"
+OK_NEW = ("    const bool ok = (sel == 2 || BbOrderFaceFixVsOk() || (sel == 0 && mrt)) &&\n"
+          "                    !BbOrderFaceFixExcluded(); // bbport-order (102)\n")
+
+
+def face_fix_exclude():
+    rz = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'renderer_vulkan' / 'vk_rasterizer.cpp'
+    rt = read(rz)
+    if 'bbport-order (102)' in rt:
+        print('102. face fix: pengecualian pixel shader (live): sudah dipatch')
+        return
+    for i, old in enumerate((EX_ANCHOR, OK_OLD)):
+        if rt.count(old) != 1:
+            sys.exit('bagian 102: titik sisip %d tidak ditemukan (bagian 101 belum terpasang?)' % i)
+    rt = rt.replace(EX_ANCHOR, EX_FUNC + EX_ANCHOR, 1).replace(OK_OLD, OK_NEW, 1)
+    write(rz, rt)
+    print('102. face fix: pengecualian hash pixel/vertex shader BB_ORDER_FACEFIX_EXCL / _EXCL_FILE (live)')
+
+# --- 103. Bawaan face fix: hanya vertex shader karakter (18 Okt 23:45) ---
+# Tes 23:43 (bagian 102, file pengecualian 16 VS gedung/lingkungan): langit & gedung jauh tidak kedip
+# dan bintik wajah tetap hilang. Yang tetap diberi bias: VS kulit wajah 193274a4 (dipakai f5c17eec,
+# tidak ada di daftar 93) + VS skinning karakter bagian 93. Bawaan sekarang = daftar putih itu
+# (BB_ORDER_FACEFIX_SEL=skin): shader lingkungan di level lain juga tidak kena bias (tidak kedip).
+# Kembali ke cara lain: BB_ORDER_FACEFIX_SEL=mrt atau all, BB_ORDER_FACEFIX_VS=daftar sendiri / all.
+SK_SEL_OLD = "        const int v = (e != nullptr && e[0] == 's') ? 1 : (e != nullptr && e[0] == 'a') ? 2 : 0;\n"
+SK_SEL_NEW = ("        const int v = (e != nullptr && e[0] == 'm') ? 0 : (e != nullptr && e[0] == 'a') ? 2 : 1; // bbport-order (103)\n")
+SK_VS_OLD = "        const char* p = (e != nullptr && !l.all && e[0] != '\\0') ? e : \"\"; // bbport-order (94): bawaan kosong\n"
+SK_VS_NEW = ("        const char* p = (e != nullptr && !l.all && e[0] != '\\0') // bbport-order (103): VS karakter\n"
+             "                            ? e\n"
+             "                            : \"193274a4,e0ec7fe0,429d950d,b938dd39,b2cc4b8f,1077f760,70b542d,bd739cf5,\"\n"
+             "                              \"231d370b,190852fd,a369ab85,59c67371,fd7e121b,b68b212f\";\n")
+
+
+def face_fix_character_vs():
+    rz = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'renderer_vulkan' / 'vk_rasterizer.cpp'
+    rt = read(rz)
+    if 'bbport-order (103)' in rt:
+        print('103. face fix bawaan hanya VS karakter: sudah dipatch')
+        return
+    for i, old in enumerate((SK_SEL_OLD, SK_VS_OLD)):
+        if rt.count(old) != 1:
+            sys.exit('bagian 103: titik sisip %d tidak ditemukan (bagian 94/101 belum terpasang?)' % i)
+    rt = rt.replace(SK_SEL_OLD, SK_SEL_NEW, 1).replace(SK_VS_OLD, SK_VS_NEW, 1)
+    write(rz, rt)
+    print('103. face fix bawaan: shader kulit f5c17eec + VS karakter (193274a4 dll); langit/gedung tidak kedip')
+
+# --- 104. Bintik wajah kembali dengan 103: 7 VS lagi ke daftar karakter (19 Okt 00:02) ---
+# Tes 23:58: dengan 103 (hanya VS karakter) bintik wajah kembali. Bisection live (102, mode mrt):
+# ronde A (bias juga untuk 56ded2fe e5979e2b ea58a717 e814de9 b01d5a25 4b97e63c 418001f4) -> bintik
+# hilang. Ketujuh VS itu (masing-masing hanya 1-4 pixel shader di log 101, bukan VS gedung besar
+# seperti 527b7ca4/4ff25bab) ditambahkan ke daftar VS karakter bawaan.
+CV_OLD = ("                              \"231d370b,190852fd,a369ab85,59c67371,fd7e121b,b68b212f\";\n")
+CV_NEW = ("                              \"231d370b,190852fd,a369ab85,59c67371,fd7e121b,b68b212f,\"\n"
+          "                              \"56ded2fe,e5979e2b,ea58a717,e814de9,b01d5a25,4b97e63c,418001f4\"; // bbport-order (104)\n")
+
+
+def face_fix_more_vs():
+    rz = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'renderer_vulkan' / 'vk_rasterizer.cpp'
+    rt = read(rz)
+    if 'bbport-order (104)' in rt:
+        print('104. face fix: 7 VS karakter tambahan: sudah dipatch')
+        return
+    if rt.count(CV_OLD) != 1:
+        sys.exit('bagian 104: daftar VS bagian 103 tidak ditemukan')
+    write(rz, rt.replace(CV_OLD, CV_NEW, 1))
+    print('104. face fix: 7 VS karakter tambahan (bintik wajah, bisection 19 Okt)')
+
+# --- 105. Bintik wajah: pixel shader kulit kedua a54a188 (19 Okt 00:16) ---
+# Tes 00:07: 104 tetap berbintik. Bisection live (102, mode mrt) atas 64 pixel shader yang kena bias di
+# adegan itu: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> a54a188 (tanpa bias -> bintik; a1accda6 tidak).
+# Log 101 mencatat a54a188 dengan VS 193274a4, tapi di adegan itu shader ini juga dipakai VS lain yang
+# tidak ada di daftar (log hanya mencatat tiap pixel shader sekali). Sekarang a54a188 masuk daftar
+# pixel shader kulit (bagian 94) bersama f5c17eec: bias berlaku apa pun VS-nya.
+PS2_OLD = "        const char* p = (e != nullptr && e[0] != '\\0') ? e : \"f5c17eec\";\n"
+PS2_NEW = "        const char* p = (e != nullptr && e[0] != '\\0') ? e : \"f5c17eec,a54a188\"; // bbport-order (105)\n"
+PS2_MSG_OLD = '(e != nullptr && e[0] != \'\\0\') ? e : "f5c17eec");\n'
+PS2_MSG_NEW = '(e != nullptr && e[0] != \'\\0\') ? e : "f5c17eec,a54a188");\n'
+
+
+def face_fix_skin_ps2():
+    rz = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'renderer_vulkan' / 'vk_rasterizer.cpp'
+    rt = read(rz)
+    if 'bbport-order (105)' in rt:
+        print('105. face fix: pixel shader kulit a54a188: sudah dipatch')
+        return
+    for i, old in enumerate((PS2_OLD, PS2_MSG_OLD)):
+        if rt.count(old) != 1:
+            sys.exit('bagian 105: daftar pixel shader bagian 94 tidak ditemukan (%d)' % i)
+    rt = rt.replace(PS2_OLD, PS2_NEW, 1).replace(PS2_MSG_OLD, PS2_MSG_NEW, 1)
+    write(rz, rt)
+    print('105. face fix: pixel shader kulit f5c17eec + a54a188 (bintik wajah, bisection 19 Okt 00:16)')
+
+# --- 106. Force close: T# sampah -> ASSERT(num_samples <= 8) di GetMacroTileExtents (19 Okt 00:18) ---
+# Log 00:18 (sesi bisection, 1080p tanpa 16:9): rentetan "Rejecting invalid T#" dengan alamat sampah,
+# lalu satu T# yang lolos (pitch 374, width 11914, data_format 61) -> tile.h:294 Assertion Failed ->
+# STOP. Sekarang GetMacroTileExtents tidak berhenti: jumlah sampel tidak masuk akal -> 1, bpp/tile mode
+# di luar tabel -> ukuran tile aman (128x64); dicatat sekali di log. Draw itu dapat texture salah, game jalan.
+MT_OLD = """    ASSERT(num_samples <= 8);
+    const auto samples_log = static_cast<u32>(std::log2(num_samples));
+    const auto row = u32(tile_mode) * 5;
+    const auto column = std::bit_width(bpp) - 4; // bpps are 8, 16, 32, 64, 128
+    return (alt ? macro_tile_extents_alt : macro_tile_extents)[samples_log][row + column];
+"""
+MT_NEW = """    // bbport-order (106): T# sampah (num_samples > 8, bpp/tile mode di luar tabel) -> nilai aman, bukan ASSERT
+    const bool bb_bad_samples = num_samples == 0 || num_samples > 8;
+    if (bb_bad_samples) {
+        num_samples = 1;
+    }
+    const auto samples_log = static_cast<u32>(std::log2(num_samples));
+    const auto row = u32(tile_mode) * 5;
+    const auto column = std::bit_width(bpp) - 4; // bpps are 8, 16, 32, 64, 128
+    const auto& bb_table = (alt ? macro_tile_extents_alt : macro_tile_extents)[samples_log];
+    const u32 bb_index = row + u32(column);
+    if (bb_bad_samples || bpp < 8 || bpp > 128 || bb_index >= bb_table.size()) {
+        if (!bb_order_mt_told) {
+            bb_order_mt_told = true;
+            std::fprintf(stderr, "bbport-order (106): T# tidak valid di GetMacroTileExtents (tile %u, bpp %u)\\n",
+                         u32(tile_mode), bpp);
+        }
+        if (bpp < 8 || bpp > 128 || bb_index >= bb_table.size()) {
+            return {128u, 64u};
+        }
+    }
+    return bb_table[bb_index];
+"""
+
+
+def macro_tile_safe():
+    th = BBPORT / 'gpu' / 'shadps4' / 'video_core' / 'texture_cache' / 'tile.h'
+    tt = read(th)
+    if 'bbport-order (106)' in tt:
+        print('106. GetMacroTileExtents tahan T# sampah: sudah dipatch')
+        return
+    if tt.count(MT_OLD) != 1:
+        sys.exit('bagian 106: isi GetMacroTileExtents tidak ditemukan di tile.h')
+    tt = tt.replace(MT_OLD, MT_NEW, 1)
+    sig = 'constexpr std::pair<u32, u32> GetMacroTileExtents('
+    if tt.count(sig) != 1:
+        sys.exit('bagian 106: GetMacroTileExtents tidak ditemukan')
+    tt = tt.replace(sig, 'inline bool bb_order_mt_told = false; // bbport-order (106)\n\n' + sig, 1)
+    if '#include <cstdio>' not in tt:
+        tt = tt.replace('#pragma once\n', '#pragma once\n\n#include <cstdio> // bbport-order (106)\n', 1)
+    write(th, tt)
+    print('106. GetMacroTileExtents: T# sampah tidak lagi STOP (force close 19 Okt 00:18)')
+
 if __name__ == '__main__':
     import_names()
     runtime_kernel()
@@ -6264,4 +6582,11 @@ if __name__ == '__main__':
     srt_walker_safe()
     bad_shader_skip()
     bad_shader_helper_order()
+    face_fix_skin_only()
+    face_fix_mrt()
+    face_fix_exclude()
+    face_fix_character_vs()
+    face_fix_more_vs()
+    face_fix_skin_ps2()
+    macro_tile_safe()
     print('Selesai. Build ulang bbport, lalu jalankan order-port.sh (tanpa --prepare).')

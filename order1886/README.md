@@ -23,9 +23,10 @@ Tested on an Intel i3-12100F with an NVIDIA RTX 3080 Ti (driver 616.92), Windows
 to install.
 
 Launcher settings: 30/60 FPS (community patch), 16:9 full screen without the black bars (also at
-2K/4K), FSR 3.1 in place of the game's TAA, MSAA on/off, anisotropic filtering, present mode,
-fullscreen/windowed, Fast (parallel) / Safe (serial) recording, background shader compiles, the
-face dot fix and an FPS counter.
+2K/4K), anisotropic filtering, present mode, fullscreen/windowed, Fast (parallel) / Safe (serial)
+recording, background shader compiles, the face dot fix and an FPS counter. Anti-aliasing is the
+game's own TAA with MSAA off (since v0.2; the FSR 3.1 hook is still there for testing through the
+launcher's *Extra env*: `BB_ORDER_TAA_HOOK=fsr3`).
 
 Status: boots, menus, gameplay and cutscenes run. Known issues:
 - Shaders seen for the first time stall the game briefly, most visibly in cutscenes. They are
@@ -33,7 +34,8 @@ Status: boots, menus, gameplay and cutscenes run. Known issues:
 - At 60 FPS the button-mash QTEs of chapters 6 and 9 cannot be completed: play those at 30 FPS.
 - 2K/4K only together with 16:9 (with the black bars the game's GPU memory gets overwritten).
 - Faces can look too dark in dark rooms.
-- DLSS (available in the Linux build) is not wired up on Windows yet; FSR 3.1 is.
+- DLSS (available in the Linux build) is not wired up on Windows yet.
+- Windows: loading one later-chapter save hung while compiling its shaders (under investigation).
 - No online features (the game sees a signed-out console).
 
 ## Linux (AppImage)
@@ -57,8 +59,9 @@ variants where the trees differ. The main fixes:
 | Runtime (`src/`) | The Order's missing system calls and stubs; the job workers' yield (`BB_ORDER_YIELD_US`) |
 | Shader recompiler | SRT walker: dynamic offsets, deferred offsets, invalid user-data pointers read as 0 instead of crashing; unaligned buffer reads; SNORM/format fallbacks |
 | Pipelines | background compiles also for indirect draws (cutscene stutter), per-frame rules so characters do not vanish; a bad shader skips the draw instead of aborting |
-| Rasterizer | face fix (depth bias for the skin pass, the game's EQUAL depth test kept so distant objects do not flicker); render targets immune to CPU/GPU-buffer writes at 1440p/4K; MSAA handling |
-| TAA | optional FSR 3.1 in place of the game's TAA (`BB_ORDER_TAA_HOOK=fsr3`) |
+| Rasterizer | face fix: depth bias only for the characters' skin and skinning shaders (skin pixel shaders `f5c17eec`/`a54a188`, the characters' vertex shaders), so distant buildings and the sky no longer flicker; the game's EQUAL depth test kept; render targets immune to CPU/GPU-buffer writes at 1440p/4K; MSAA handling |
+| Textures | a garbage texture descriptor (more than 8 samples) no longer stops the game (`tile.h`) |
+| TAA | optional FSR 3.1 in place of the game's TAA (`BB_ORDER_TAA_HOOK=fsr3`, testing only) |
 | Windows only | SRT recovery through `bb_setjmp`; the Linux DLSS hook falls back to FSR 3.1; branding (window and menu title, exe icon) |
 
 `order1886/order_patches.py` writes the FPS/resolution community patches (`out\patches.bin`, from
@@ -81,7 +84,7 @@ python order1886/order_run.py --prepare         # ORDER_GAME=<your CUSA00035 fol
 The portable package (python.org Python with Tkinter, in PowerShell):
 
 ```powershell
-py -3 order1886\make_order_portable.py --version v0.1
+py -3 order1886\make_order_portable.py --version v0.2
 ```
 
 ## License

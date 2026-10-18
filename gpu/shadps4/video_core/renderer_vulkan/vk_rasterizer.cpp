@@ -4733,7 +4733,7 @@ static bool BbOrderFaceFixPsOk() {
     static const List list = [] {
         List l;
         const char* e = std::getenv("BB_ORDER_FACEFIX_PS");
-        const char* p = (e != nullptr && e[0] != '\0') ? e : "f5c17eec";
+        const char* p = (e != nullptr && e[0] != '\0') ? e : "f5c17eec,a54a188"; // bbport-order (105)
         while (*p && l.n < 32) {
             char* end = nullptr;
             const u64 v = std::strtoull(p, &end, 16);
@@ -4743,7 +4743,7 @@ static bool BbOrderFaceFixPsOk() {
             l.h[l.n++] = v;
             p = (*end == ',') ? end + 1 : end;
         }
-        std::printf("bbport-order (94): face fix untuk pixel shader %s\n", (e != nullptr && e[0] != '\0') ? e : "f5c17eec");
+        std::printf("bbport-order (94): face fix untuk pixel shader %s\n", (e != nullptr && e[0] != '\0') ? e : "f5c17eec,a54a188");
         std::fflush(stdout);
         return l;
     }();
@@ -4753,6 +4753,112 @@ static bool BbOrderFaceFixPsOk() {
         }
     }
     return false;
+}
+// bbport-order (102): pixel/vertex shader tanpa face bias (BB_ORDER_FACEFIX_EXCL, BB_ORDER_FACEFIX_EXCL_FILE live)
+static void BbOrderParseHexList(const char* s, std::vector<u64>& out) {
+    out.clear();
+    while (s != nullptr && *s) {
+        char* end = nullptr;
+        const u64 v = std::strtoull(s, &end, 16);
+        if (end == s) {
+            ++s;
+            continue;
+        }
+        if (v != 0) {
+            out.push_back(v);
+        }
+        s = end;
+    }
+}
+static bool BbOrderFaceFixExcluded() {
+    static std::mutex mu;
+    static std::vector<u64> base, file;
+    static long long next = 0;
+    static const char* path = std::getenv("BB_ORDER_FACEFIX_EXCL_FILE");
+    std::lock_guard<std::mutex> lk(mu);
+    static const bool init = [] {
+        BbOrderParseHexList(std::getenv("BB_ORDER_FACEFIX_EXCL"), base);
+        std::printf("bbport-order (102): face fix dikecualikan %zu shader%s%s\n", base.size(),
+                    path ? ", file live " : "", path ? path : "");
+        std::fflush(stdout);
+        return true;
+    }();
+    (void)init;
+    if (path != nullptr) {
+        const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        if (now >= next) {
+            next = now + 500;
+            std::string text;
+            if (FILE* f = std::fopen(path, "r")) {
+                char buf[4096];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0 && text.size() < (1u << 20)) {
+                    text.append(buf, n);
+                }
+                std::fclose(f);
+            }
+            std::vector<u64> fresh;
+            BbOrderParseHexList(text.c_str(), fresh);
+            if (fresh != file) {
+                file.swap(fresh);
+                std::printf("bbport-order (102): file pengecualian: %zu shader\n", file.size());
+                std::fflush(stdout);
+            }
+        }
+    }
+    for (const u64 h : base) {
+        if (h == bb_order_ff_ps || h == bb_order_ff_vs) {
+            return true;
+        }
+    }
+    for (const u64 h : file) {
+        if (h == bb_order_ff_ps || h == bb_order_ff_vs) {
+            return true;
+        }
+    }
+    return false;
+}
+// bbport-order (101): pilihan draw untuk face bias (BB_ORDER_FACEFIX_SEL=mrt|skin|all)
+static bool BbOrderFaceFixVsOk();
+static bool BbOrderFaceFixSelOk(bool mrt) {
+    static const int sel = [] {
+        const char* e = std::getenv("BB_ORDER_FACEFIX_SEL");
+        const int v = (e != nullptr && e[0] == 'm') ? 0 : (e != nullptr && e[0] == 'a') ? 2 : 1; // bbport-order (103)
+        std::printf("bbport-order (101): face fix memilih draw: %s\n",
+                    v == 1 ? "skin (daftar shader)" : v == 2 ? "all (semua draw)" : "mrt (daftar shader + 2+ target)");
+        std::fflush(stdout);
+        return v;
+    }();
+    const bool ok = (sel == 2 || BbOrderFaceFixVsOk() || (sel == 0 && mrt)) &&
+                    !BbOrderFaceFixExcluded(); // bbport-order (102)
+    if (ok) {
+        static std::atomic<u64> seen[512]{};
+        static std::atomic<u32> logged{0};
+        const u64 key = (bb_order_ff_ps << 1) | (mrt ? 1u : 0u);
+        if (key != 0 && logged.load(std::memory_order_relaxed) < 256) {
+            u32 i = u32((key * 0x9E3779B97F4A7C15ull) >> 55) & 511u;
+            for (u32 n = 0; n < 512; ++n, i = (i + 1) & 511u) {
+                u64 cur = seen[i].load(std::memory_order_relaxed);
+                if (cur == key) {
+                    break;
+                }
+                if (cur == 0 && seen[i].compare_exchange_strong(cur, key)) {
+                    logged.fetch_add(1, std::memory_order_relaxed);
+                    std::printf("bbport-order (101): bias ps %llx vs %llx mrt %d\n",
+                                (unsigned long long)bb_order_ff_ps, (unsigned long long)bb_order_ff_vs,
+                                mrt ? 1 : 0);
+                    std::fflush(stdout);
+                    break;
+                }
+                if (cur == key) {
+                    break;
+                }
+            }
+        }
+    }
+    return ok;
 }
 static bool BbOrderFaceFixVsOk() {
     if (BbOrderFaceFixPsOk()) { // bbport-order (94)
@@ -4766,10 +4872,14 @@ static bool BbOrderFaceFixVsOk() {
     static const List list = [] {
         List l;
         const char* e = std::getenv("BB_ORDER_FACEFIX_VS");
-        if (e == nullptr || e[0] == '\0' || e[0] == 'a' || e[0] == 'A') { // bbport-order (95): bawaan semua
+        if (e != nullptr && (e[0] == 'a' || e[0] == 'A')) { // bbport-order (100): bawaan hanya daftar shader
             l.all = true;
         }
-        const char* p = (e != nullptr && !l.all && e[0] != '\0') ? e : ""; // bbport-order (94): bawaan kosong
+        const char* p = (e != nullptr && !l.all && e[0] != '\0') // bbport-order (103): VS karakter
+                            ? e
+                            : "193274a4,e0ec7fe0,429d950d,b938dd39,b2cc4b8f,1077f760,70b542d,bd739cf5,"
+                              "231d370b,190852fd,a369ab85,59c67371,fd7e121b,b68b212f,"
+                              "56ded2fe,e5979e2b,ea58a717,e814de9,b01d5a25,4b97e63c,418001f4"; // bbport-order (104)
         while (!l.all && *p && l.n < 48) {
             char* end = nullptr;
             const u64 v = std::strtoull(p, &end, 16);
@@ -5091,9 +5201,10 @@ void Rasterizer::UpdateDepthStencilState() const {
                                   !regs.depth_render_control.depth_clear_enable;
         const bool bb_ff_hit =
             bb_ff == 2 ? (!depth_bias_enabled && regs.color_buffers[0] && regs.color_buffers[1])
-                       : (bb_ff == 1 && !bb_ff_writes && regs.color_buffers[0] && BbOrderFaceFixVsOk() &&
+                       : (bb_ff == 1 && !bb_ff_writes && regs.color_buffers[0] &&
                           (regs.depth_control.depth_func != AmdGpu::CompareFunc::Equal ||
-                           BbOrderFaceFixEqualOk())); // (93/95)
+                           BbOrderFaceFixEqualOk()) &&
+                          BbOrderFaceFixSelOk(bool(regs.color_buffers[1]))); // (93/95/101) bbport-order (101)
         if (bb_ff_hit && (BbOrderDsFlags() & (64 | 128)) == 0 && depth_test_enabled) {
             dynamic_state.SetDepthBiasEnabled(true);
             static const char* fb_path = std::getenv("BB_ORDER_FACEBIAS_FILE"); // bbport-order (60)
