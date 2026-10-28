@@ -81,6 +81,9 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     if (code < code_start || code >= code_end) {
         return false; // Not in SRT code range
     }
+    if (runtime_fault_recover != nullptr) { // bbport-order-win (107): recover this thread (bb_longjmp)
+        return false;                       // instead of patching the shared walker code
+    }
 
     // Patch instruction to zero register
     ZydisDecodedInstruction instruction;

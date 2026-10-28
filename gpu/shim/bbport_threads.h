@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <thread>
 #ifdef _WIN32
 #include <bit>
@@ -31,6 +32,25 @@ inline unsigned Available() {
 inline void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
 }
+
+/// bbport-order-win (112): the port's own threads (GPU command thread, draw pipe stage B, Vulkan
+/// recorders, copy threads) above the game's spinning workers: a yield or a wake-up does not
+/// wait behind them. BB_ORDER_HOST_PRIORITY: 0 off, 1 above normal (default), 2 highest.
+inline int HostPriorityLevel() {
+    static const int level = [] {
+        const char* env = std::getenv("BB_ORDER_HOST_PRIORITY");
+        return env && *env ? std::atoi(env) : 1;
+    }();
+    return level;
+}
+inline void RaiseHostPriority() {
+    const int level = HostPriorityLevel();
+    if (level >= 2) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    } else if (level == 1) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
 #else
 
 /// Hardware threads available to the process.
@@ -42,6 +62,9 @@ inline unsigned Available() {
     }
     return std::max(1u, std::thread::hardware_concurrency());
 }
+
+inline int HostPriorityLevel() { return 0; }
+inline void RaiseHostPriority() {} // bbport-order-win (112): Windows only
 
 /// The calling thread only runs on otherwise idle cores (falls back to the lowest nice level).
 inline void MakeBackground() {

@@ -196,6 +196,7 @@ private:
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
+        BbThreads::RaiseHostPriority(); // bbport-order-win (112)
         on_stage_b = true;
         BbSections::recording_thread = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);

@@ -51,9 +51,10 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 FPS = ['30', '60']        # 60 = maximum (above it the game logic breaks; QTE in chapters 6/9: use 30)
 RES = {'1080p (native)': 'native', '2K (2560x1440)': '2560x1440', '4K (3840x2160)': '3840x2160'}
-# Anti-aliasing: always the game's own TAA, MSAA off (BB_ORDER_NO_MSAA=1, section 49). The upscaler
-# hook (FSR 3.1 in place of TAA, section 75) and MSAA 4x are no longer offered (19 Oct): lighter,
-# simpler. Extra env BB_ORDER_TAA_HOOK=fsr3 or BB_ORDER_NO_MSAA=0 still work for testing.
+# Anti-aliasing: always the game's own AA, TAA + MSAA 4x (BB_ORDER_NO_MSAA=0). The upscaler hook
+# (FSR 3.1 in place of TAA, section 75) is no longer offered (19 Oct). MSAA off (section 49) was the
+# v0.2 default; with it a cutscene went fully blurred (28 Oct, likely its depth of field); it stays
+# available for testing through Extra env BB_ORDER_NO_MSAA=1 (and BB_ORDER_TAA_HOOK=fsr3).
 ANISO = {'Game': '0', '4x': '4', '8x': '8', '16x': '16'}
 PRESENT = {'Mailbox': 'Mailbox', 'VSync': 'Fifo', 'Immediate': 'Immediate'}
 DISPLAY = ('Fullscreen', 'Windowed')
@@ -69,9 +70,22 @@ ORDER_ENV = {
     # Windows: the PC memory model (dma-buf) is Linux only -> the 0.3 model, as run.py.
     'BB_PREUPLOAD': '1', 'BB_UFFD': '0', 'BB_COPY_GPU_BUFFERS': '1',
     'BB_GPU_WRITE_TWINS': '1', 'BB_GPU_WRITE_TWINS_MAX': '65536',
+    # GPU log: errors only (29 Oct). Every warning went unbuffered to order_play.log from the draw
+    # recording thread (dozens per frame, "isn't dword aligned", "Rejecting invalid T#"); on
+    # Windows each line is a WriteFile the antivirus also inspects: 31-33 FPS in Chapter I, 60
+    # without them (draw pipe stage B 24 -> 5 us per draw, as on Linux). Extra env
+    # BB_GPU_LOG=warning brings them back for debugging.
+    'BB_GPU_LOG': 'error',
 }
 
 BG, PANEL, FG, DIM, ACCENT, WARN = '#1e1f24', '#2a2c33', '#e8e8ec', '#9a9ca6', '#8a6a3a', '#e0a040'
+# Look chosen in the launcher editor (28 Oct): font, outer spacing.
+FONT, PAD = 'Trebuchet MS', 35
+# Type sizes and the space above each element, from the launcher editor (29 Oct).
+SET, HEAD, NOTE, SMALL, PLAY = 25, 36, 13, 15, 15
+GAP = {'title': 16, 'subtitle': 4, 'folder': 24, 'play': 8, 'buttons': 12, 'status': 29,
+       'fps': 8, 'resolution': 2, 'anisotropic': 2, 'present': 2, 'display': 2, 'performance': 2,
+       'aspect': 10, 'async': 0, 'facefix': 4, 'showfps': 0, 'extra_env': 10, 'note': 10}
 
 
 def read_sfo(folder):
@@ -140,31 +154,53 @@ class Launcher:
         root.resizable(False, False)
         self.style()
 
-        f = ttk.Frame(root, padding=12)
+        # Landscape, 2x size (28 Oct): left = game, folder, Play; right = settings.
+        f = ttk.Frame(root, padding=PAD)
         f.pack(fill='both', expand=True)
-        top = ttk.Frame(f)
-        top.pack(fill='x')
-        self.lbl_icon = ttk.Label(top, text='1886')
-        self.lbl_icon.pack(side='left', padx=(0, 10))
-        right = ttk.Frame(top)
-        right.pack(side='left', fill='x', expand=True)
-        ttk.Label(right, text=APP, style='Title.TLabel').pack(anchor='w')
-        ttk.Label(right, text='CUSA00035 v01.02  ·  PC port (Windows)', style='Dim.TLabel').pack(anchor='w')
+        left = ttk.Frame(f)
+        left.grid(row=0, column=0, sticky='nsew', padx=(0, PAD))
+        opts = ttk.Frame(f, style='Panel.TFrame', padding=16)
+        opts.grid(row=0, column=1, sticky='nsew')
+        f.columnconfigure(1, weight=1)
+        f.rowconfigure(0, weight=1)
 
-        opts = ttk.Frame(f, style='Panel.TFrame', padding=10)
-        opts.pack(fill='x', pady=10)
-        opts.columnconfigure(1, weight=1)
-        ttk.Label(opts, text='Game folder', style='Panel.TLabel').grid(row=0, column=0, sticky='w')
-        row = ttk.Frame(opts, style='Panel.TFrame')
-        row.grid(row=0, column=1, sticky='e', pady=2)
+        self.lbl_icon = ttk.Label(left, text='1886', style='Title.TLabel', anchor='center')
+        self.lbl_icon.pack(anchor='center')
+        ttk.Label(left, text=APP, style='Title.TLabel', anchor='center').pack(anchor='center', pady=(GAP['title'], 0))
+        ttk.Label(left, text='CUSA00035 v01.02  ·  PC port (Windows)', style='Dim.TLabel',
+                  anchor='center').pack(anchor='center', pady=(GAP['subtitle'], 0))
+
+        folder = ttk.Frame(left, style='Panel.TFrame', padding=16)
+        folder.pack(fill='x', pady=(GAP['folder'], 0))
+        ttk.Label(folder, text='Game folder', style='Panel.TLabel').pack(anchor='w')
+        row = ttk.Frame(folder, style='Panel.TFrame')
+        row.pack(fill='x', pady=(8, 0))
         self.lbl_folder = ttk.Label(row, style='Folder.TLabel')
         self.lbl_folder.pack(side='left')
-        ttk.Button(row, text='Browse…', width=8, command=self.browse).pack(side='left', padx=(6, 0))
+        ttk.Button(row, text='Browse…', width=8, command=self.browse).pack(side='right', padx=(12, 0))
 
-        def combo(r, label, var, values):
-            ttk.Label(opts, text=label, style='Panel.TLabel').grid(row=r, column=0, sticky='w')
-            cb = ttk.Combobox(opts, textvariable=var, values=values, state='readonly', width=24)
-            cb.grid(row=r, column=1, sticky='e', pady=2)
+        self.btn_play = ttk.Button(left, text='▶  Play', style='Play.TButton', command=self.play)
+        self.btn_play.pack(fill='x', pady=(GAP['play'], 0))
+        buttons = ttk.Frame(left)
+        buttons.pack(fill='x', pady=(GAP['buttons'], 0))
+        for i, (text, cmd) in enumerate((('Log', self.open_log), ('Saves', self.open_saves),
+                                         ('Cache', self.clear_cache), ('Prepare', self.reprepare))):
+            buttons.columnconfigure(i, weight=1, uniform='b')
+            ttk.Button(buttons, text=text, command=cmd).grid(row=0, column=i, sticky='ew',
+                                                             padx=(0 if i == 0 else 12, 0))
+        self.lbl_status = ttk.Label(left, style='Dim.TLabel', wraplength=520, justify='left')
+        self.lbl_status.pack(anchor='w', pady=(GAP['status'], 0))
+
+        opts.columnconfigure(1, weight=1)
+        ttk.Label(opts, text='Settings', style='Head.TLabel').grid(row=0, column=0, columnspan=2,
+                                                                 sticky='w')
+
+        def combo(r, label, var, values, key):
+            ttk.Label(opts, text=label, style='Set.TLabel').grid(row=r, column=0, sticky='w', padx=(0, 16),
+                                                                 pady=(GAP[key], 0))
+            cb = ttk.Combobox(opts, textvariable=var, values=values, state='readonly', width=24,
+                              font=(FONT, SET))
+            cb.grid(row=r, column=1, sticky='ew', pady=(GAP[key], 0))
             cb.bind('<<ComboboxSelected>>', lambda e: self.changed())
             return cb
 
@@ -172,7 +208,7 @@ class Launcher:
         self.v_fps = pick('fps', FPS, '60')
         self.v_res = pick('resolution', RES, '1080p (native)')
         self.v_af = pick('anisotropic', ANISO, 'Game')
-        self.v_present = pick('present', PRESENT, 'Mailbox')
+        self.v_present = pick('present', PRESENT, 'VSync')
         self.v_mode = pick('display', DISPLAY, 'Fullscreen')
         self.v_perf = pick('performance', PERF, PERF[0])
         self.v_aspect = tk.BooleanVar(value=bool(c.get('aspect169', False)))
@@ -180,70 +216,64 @@ class Launcher:
         self.v_facefix = tk.BooleanVar(value=bool(c.get('facefix', True)))
         self.v_showfps = tk.BooleanVar(value=bool(c.get('show_fps', True)))
         self.v_env = tk.StringVar(value=c.get('extra_env', ''))
-        combo(1, 'FPS', self.v_fps, FPS)
-        self.c_res = combo(2, 'Resolution', self.v_res, list(RES))
-        combo(3, 'Anisotropic', self.v_af, list(ANISO))
-        combo(4, 'Present mode', self.v_present, list(PRESENT))
-        combo(5, 'Display', self.v_mode, list(DISPLAY))
-        combo(6, 'Performance', self.v_perf, list(PERF))
-        checks = (('16:9 full screen (no black bars) (supports 2K and 4K)', self.v_aspect),
-                  ('Compile shaders in the background (less stutter)', self.v_async),
-                  ('Face dot fix', self.v_facefix),
-                  ('FPS counter in game', self.v_showfps))
-        for i, (text, var) in enumerate(checks):
+        combo(1, 'FPS', self.v_fps, FPS, 'fps')
+        self.c_res = combo(2, 'Resolution', self.v_res, list(RES), 'resolution')
+        combo(3, 'Anisotropic', self.v_af, list(ANISO), 'anisotropic')
+        combo(4, 'Present mode', self.v_present, list(PRESENT), 'present')
+        combo(5, 'Display', self.v_mode, list(DISPLAY), 'display')
+        combo(6, 'Performance', self.v_perf, list(PERF), 'performance')
+        checks = (('16:9 full screen (no black bars) (supports 2K and 4K)', self.v_aspect, 'aspect'),
+                  ('Compile shaders in the background (less stutter)', self.v_async, 'async'),
+                  ('Face dot fix', self.v_facefix, 'facefix'),
+                  ('FPS counter in game', self.v_showfps, 'showfps'))
+        for i, (text, var, key) in enumerate(checks):
             ttk.Checkbutton(opts, text=text, variable=var, command=self.changed,
                             style='Panel.TCheckbutton').grid(row=7 + i, column=0, columnspan=2,
-                                                             sticky='w', pady=(6 if i == 0 else 1, 0))
-        ttk.Label(opts, text='Extra env', style='Panel.TLabel').grid(row=11, column=0, sticky='w', pady=(8, 0))
-        e = ttk.Entry(opts, textvariable=self.v_env, width=30)
-        e.grid(row=11, column=1, sticky='e', pady=(8, 0))
+                                                             sticky='w', pady=(GAP[key], 0))
+        ttk.Label(opts, text='Extra env', style='Set.TLabel').grid(row=11, column=0, sticky='w', pady=(GAP['extra_env'], 0))
+        e = ttk.Entry(opts, textvariable=self.v_env, width=30, font=(FONT, SET))
+        e.grid(row=11, column=1, sticky='ew', pady=(GAP['extra_env'], 0))
         e.bind('<FocusOut>', lambda ev: self.changed())
-        self.lbl_note = ttk.Label(opts, style='Note.TLabel', wraplength=420, justify='left')
-        self.lbl_note.grid(row=12, column=0, columnspan=2, sticky='w', pady=(8, 0))
-
-        buttons = ttk.Frame(f)
-        buttons.pack(fill='x')
-        self.btn_play = ttk.Button(buttons, text='▶  Play', style='Play.TButton', command=self.play)
-        self.btn_play.pack(side='left', fill='x', expand=True)
-        for text, width, cmd in (('Log', 5, self.open_log), ('Saves', 6, self.open_saves),
-                                 ('Cache', 6, self.clear_cache), ('Prepare', 8, self.reprepare)):
-            ttk.Button(buttons, text=text, width=width, command=cmd).pack(side='left', padx=(6, 0))
-        self.lbl_status = ttk.Label(f, style='Dim.TLabel')
-        self.lbl_status.pack(anchor='w', pady=(8, 0))
+        self.lbl_note = ttk.Label(opts, style='Note.TLabel', wraplength=560, justify='left')
+        self.lbl_note.grid(row=12, column=0, columnspan=2, sticky='w', pady=(GAP['note'], 0))
 
         root.bind('<Return>', lambda e: self.play())
         root.bind('<Escape>', lambda e: root.destroy())
         self.refresh()
-        self.status('Ready. Enter = Play, Esc = quit.')
+        self.status('EXPERIMENTAL')
 
     def style(self):
         s = ttk.Style(self.root)
         s.theme_use('clam')
         s.configure('.', background=BG, foreground=FG, fieldbackground=PANEL, bordercolor=PANEL,
-                    lightcolor=PANEL, darkcolor=PANEL, font=('Segoe UI', 10))
+                    lightcolor=PANEL, darkcolor=PANEL, font=(FONT, 20))
         s.configure('TFrame', background=BG)
         s.configure('Panel.TFrame', background=PANEL)
         s.configure('TLabel', background=BG, foreground=FG)
-        s.configure('Title.TLabel', font=('Segoe UI', 13, 'bold'))
-        s.configure('Dim.TLabel', foreground=DIM, font=('Segoe UI', 9))
+        s.configure('Title.TLabel', font=(FONT, 30, 'bold'))
+        s.configure('Head.TLabel', background=PANEL, foreground=FG, font=(FONT, HEAD, 'bold'))
+        s.configure('Dim.TLabel', foreground=DIM, font=(FONT, SMALL))
         s.configure('Panel.TLabel', background=PANEL)
-        s.configure('Folder.TLabel', background=PANEL, foreground=DIM, font=('Segoe UI', 9))
-        s.configure('Note.TLabel', background=PANEL, foreground=WARN, font=('Segoe UI', 9))
-        s.configure('Panel.TCheckbutton', background=PANEL, foreground=FG)
+        s.configure('Set.TLabel', background=PANEL, font=(FONT, SET))
+        s.configure('Folder.TLabel', background=PANEL, foreground=DIM, font=(FONT, SMALL))
+        s.configure('Note.TLabel', background=PANEL, foreground=WARN, font=(FONT, NOTE))
+        s.configure('Panel.TCheckbutton', background=PANEL, foreground=FG, indicatorsize=16, padding=2,
+                    font=(FONT, SET))
         s.map('Panel.TCheckbutton', background=[('active', PANEL)],
               indicatorcolor=[('selected', ACCENT), ('!selected', BG)])
-        s.configure('TEntry', fieldbackground=BG, foreground=FG, insertcolor=FG)
-        s.configure('TCombobox', arrowcolor=FG, foreground=FG, padding=3)
+        s.configure('TEntry', fieldbackground=BG, foreground=FG, insertcolor=FG, padding=3)
+        s.configure('TCombobox', arrowcolor=FG, foreground=FG, padding=3, arrowsize=16)
         s.map('TCombobox', fieldbackground=[('readonly', BG)], foreground=[('readonly', FG)],
               selectbackground=[('readonly', BG)], selectforeground=[('readonly', FG)])
-        s.configure('TButton', background=PANEL, foreground=FG, padding=6, borderwidth=0)
+        s.configure('TButton', background=PANEL, foreground=FG, padding=12, borderwidth=0)
         s.map('TButton', background=[('active', '#383b44'), ('disabled', PANEL)],
               foreground=[('disabled', DIM)])
-        s.configure('Play.TButton', background=ACCENT, font=('Segoe UI', 11, 'bold'))
+        s.configure('Play.TButton', background=ACCENT, font=(FONT, PLAY, 'bold'), padding=20)
         s.map('Play.TButton', background=[('active', '#a07c46'), ('disabled', PANEL)])
         self.root.option_add('*TCombobox*Listbox.background', PANEL)
         self.root.option_add('*TCombobox*Listbox.foreground', FG)
         self.root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
+        self.root.option_add('*TCombobox*Listbox.font', (FONT, SET))
 
     # ---- state ---------------------------------------------------------------------------
     def game(self):
@@ -293,7 +323,7 @@ class Launcher:
         if self.icon is None and ok:
             try:
                 img = tk.PhotoImage(file=str(g / 'sce_sys' / 'icon0.png'))
-                self.icon = img.subsample(max(1, img.width() // 64))
+                self.icon = img.subsample(max(1, img.width() // 256))   # 2x (was 64 px; landscape layout)
                 self.lbl_icon.configure(image=self.icon, text='')
                 self.root.iconphoto(False, self.icon)
             except tk.TclError:
@@ -401,7 +431,7 @@ class Launcher:
         env['BB_ANISO'] = ANISO[self.v_af.get()]
         env['BB_PRESENT_MODE'] = PRESENT[self.v_present.get()]
         env['BB_FULLSCREEN'] = '1' if self.v_mode.get() == 'Fullscreen' else '0'
-        env['BB_ORDER_NO_MSAA'] = '1'
+        env['BB_ORDER_NO_MSAA'] = '0'   # MSAA on (28 Oct: off likely broke cutscene depth of field)
         env['BB_ASYNC_PIPELINES'] = '1' if self.v_async.get() else '0'
         env['BB_ORDER_FACEFIX'] = '1' if self.v_facefix.get() else '0'
         for pair in self.extra_pairs():

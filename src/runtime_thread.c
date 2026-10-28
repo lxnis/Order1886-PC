@@ -350,6 +350,38 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     /* No host unwinder: guest frames have no registered FDEs. */
     exit_longjmp(t);
 }
+/* bbport-order-win (113): winpthreads' nanosleep sleeps whole milliseconds (50 us -> Sleep(0), a
+   spin). A high-resolution waitable timer sleeps microseconds (Windows 10 1803+). */
+#ifdef _WIN32
+static void bb_order_sleep_us(int us) {
+    static __thread HANDLE timer;
+    static __thread int tried;
+    static int told;
+    if (!tried) {
+        tried = 1;
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+        if (!__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED)) {
+            fprintf(stderr, "bbport-order (113): Task Kernel tidur %d us lewat %s\n", us,
+                    timer ? "timer resolusi tinggi" : "Sleep(1)");
+        }
+    }
+    if (timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)us * 10; /* 100 ns units, relative */
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
+    Sleep(1);
+}
+#else
+static void bb_order_sleep_us(int us) {
+    struct timespec ts = {0, (long)us * 1000L};
+    nanosleep(&ts, NULL);
+}
+#endif
 static ABI int32_t thread_yield(void) { /* bbport-order (74) */
     static int sleep_us = -1;
     if (sleep_us < 0) {
@@ -361,13 +393,11 @@ static ABI int32_t thread_yield(void) { /* bbport-order (74) */
     }
     static __thread int task_kernel = -1;
     if (task_kernel < 0) {
-        char name[32] = {0};
-        pthread_getname_np(pthread_self(), name, sizeof name);
-        task_kernel = strncmp(name, "Task Kernel", 11) == 0;
+        const char *name = runtime_thread_current_name(); /* bbport-order-win (113) */
+        task_kernel = name && strncmp(name, "Task Kernel", 11) == 0;
     }
     if (sleep_us > 0 && task_kernel) {
-        struct timespec ts = {0, (long)sleep_us * 1000L};
-        nanosleep(&ts, NULL);
+        bb_order_sleep_us(sleep_us); /* bbport-order-win (113) */
     } else {
         sched_yield();
     }

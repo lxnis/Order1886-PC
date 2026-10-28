@@ -70,6 +70,14 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     }
 }
 
+// bbport-order-win (115): one dword of guest memory at a per-lane 64-bit address (ADDR64 loads),
+// through the direct memory access lookup (missing pages read as 0).
+Id EmitReadGuestU32(EmitContext& ctx, Id address) {
+    ASSERT(EmulatorSettings.IsDirectMemoryAccessEnabled());
+    return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const_dynamic,
+                              ctx.OpBitcast(ctx.U32[2], address), ctx.u32_zero_value);
+}
+
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {

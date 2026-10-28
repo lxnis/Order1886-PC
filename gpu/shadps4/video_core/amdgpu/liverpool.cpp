@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <pthread.h>
 #ifndef _WIN32
@@ -64,6 +65,145 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define YIELD_GFX() YIELD(dcb_task_name)
 #define YIELD_ASC(id) YIELD(acb_task_name[id])
 
+// bbport-order-win (108): a GPU wait that is never met froze the game (Galahad's jump): log it and go
+// on after BB_ORDER_STALL_MS (default 4000, 0 = wait forever).
+#include <atomic>
+#include <cstdlib>
+static bool BbOrderStall(u64& t0, const char* what, const void* pkt, const volatile u32* mem) {
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
+    if (t0 == 0) {
+        t0 = now;
+        return false;
+    }
+    static const u64 limit = [] {
+        const char* e = std::getenv("BB_ORDER_STALL_MS");
+        return e && *e ? u64(std::strtoull(e, nullptr, 10)) : u64(4000);
+    }();
+    if (limit == 0 || now - t0 < limit) {
+        return false;
+    }
+    static std::atomic<u32> told{0};
+    if (told.fetch_add(1) < 64) {
+        const u32* p = static_cast<const u32*>(pkt);
+        std::fprintf(stderr,
+                     "bbport-order (108): GPU menunggu %s %llu ms -> dilewati; paket %08x %08x "
+                     "%08x %08x %08x %08x %08x",
+                     what, (unsigned long long)(now - t0), p[0], p[1], p[2], p[3], p[4], p[5],
+                     p[6]);
+        if (mem != nullptr) {
+            std::fprintf(stderr, "; nilai di alamat %08x", *mem);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+    t0 = 0;
+    return true;
+}
+// bbport-order-win (109): the last compute submissions, logged when a Rewind waits too long.
+struct BbOrderAscSub {
+    u32 vqid;
+    const u32* data;
+    u32 dwords;
+    u64 ms;
+};
+static std::array<BbOrderAscSub, 32> bb_order_asc_subs{};
+static std::atomic<u32> bb_order_asc_next{0};
+static u64 BbOrderNowMs() {
+    return u64(std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+}
+static void BbOrderAscNote(u32 vqid, std::span<const u32> acb) {
+    const u32 i = bb_order_asc_next.fetch_add(1) % bb_order_asc_subs.size();
+    bb_order_asc_subs[i] = {vqid, acb.data(), u32(acb.size()), BbOrderNowMs()};
+}
+static void BbOrderAscDump(const void* pkt) {
+    static std::atomic<u32> told{0};
+    if (told.fetch_add(1) >= 4) {
+        return;
+    }
+    const u64 now = BbOrderNowMs();
+    const auto at = reinterpret_cast<uintptr_t>(pkt);
+    std::fprintf(stderr, "bbport-order (109): Rewind macet di %p; kiriman compute terakhir:\n", pkt);
+    const u32 n = bb_order_asc_next.load();
+    for (u32 k = 0; k < bb_order_asc_subs.size() && k < n; ++k) {
+        const auto& e = bb_order_asc_subs[(n - 1 - k) % bb_order_asc_subs.size()];
+        const auto b = reinterpret_cast<uintptr_t>(e.data), end = b + e.dwords * 4ull;
+        std::fprintf(stderr, "  vq %u  %p..%p  %u dword  %llu ms lalu%s\n", e.vqid, (const void*)b,
+                     (const void*)end, e.dwords, (unsigned long long)(now - e.ms),
+                     at >= b && at < end ? "  <== berisi Rewind" : "");
+    }
+    std::fflush(stderr);
+}
+// bbport-order-win (110): the memory around a stuck Rewind and what is left of its buffer.
+static void BbOrderRewindCtx(const void* pkt, std::span<const u32> rest, u32 vqid) {
+    static std::atomic<u32> told{0};
+    if (told.fetch_add(1) >= 3) {
+        return;
+    }
+    const u32* p = static_cast<const u32*>(pkt);
+    std::fprintf(stderr, "bbport-order (110): Rewind vq %u di %p, sisa buffer %zu dword (%p..%p)\n",
+                 vqid + 1, pkt, rest.size(), (const void*)rest.data(),
+                 (const void*)(rest.data() + rest.size()));
+    for (int row = -32; row < 16; row += 8) {
+        std::fprintf(stderr, "  %+4d:", row);
+        for (int k = 0; k < 8; ++k) {
+            std::fprintf(stderr, " %08x", p[row + k]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+// bbport-order-win (114): BB_COMPUTE_PIPE (after TOport, IgorAugustoHH/The-Order-1886-PC-Port,
+// GPL-2.0-or-later). a = compute packets that only reach memory through the draw pipe do not
+// drain it first; e = graphics waits let the other queues run once before draining.
+static bool BbComputePipeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_COMPUTE_PIPE");
+        const bool v = env && env[0] == '1';
+        if (v) {
+            const char* parts = std::getenv("BB_COMPUTE_PIPE_PARTS");
+            std::fprintf(stderr, "bbport-order (114): compute pipe aktif, bagian %s\n",
+                         parts ? parts : "ae");
+        }
+        return v;
+    }();
+    return on;
+}
+static bool BbComputePart(char part) {
+    static const std::string parts = [] {
+        const char* env = std::getenv("BB_COMPUTE_PIPE_PARTS");
+        return std::string(env ? env : "ae");
+    }();
+    return BbComputePipeOn() && parts.find(part) != std::string::npos;
+}
+static bool BbComputePacketPipelined(std::span<const u32> acb) {
+    const auto* header = reinterpret_cast<const PM4Header*>(acb.data());
+    if (header->type != 3 || header->type3.NumWords() + 1 > acb.size()) {
+        return false;
+    }
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::IndirectBuffer:
+        return true;
+    default:
+        return false; // ReleaseMem, WriteData, DmaData, Rewind, ...: drained first
+    }
+}
+#define BB_ORDER_WRM_MEM(w)                                                                  \
+    ((w)->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory                             \
+         ? (w)->Address<const volatile u32*>()                                                \
+         : nullptr)
+
 #define RESUME(task, name)                                                                         \
     FIBER_EXIT;                                                                                    \
     task.handle.resume();                                                                          \
@@ -123,6 +263,9 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    BbThreads::RaiseHostPriority(); // bbport-order-win (112)
+    std::fprintf(stderr, "bbport-order (112): prioritas thread port = %d (BB_ORDER_HOST_PRIORITY)\n",
+                 BbThreads::HostPriorityLevel());
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -1690,7 +1833,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    u64 bb_stall = 0;
                     while (!mem_semaphore->Signaled()) {
+                        if (BbOrderStall(bb_stall, "MemSemaphore gfx", header, nullptr)) {
+                            break;
+                        }
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
@@ -1706,7 +1853,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                u64 bb_stall = 0;
                 while (!rewind->Valid()) {
+                    (void)BbOrderStall(bb_stall, "Rewind gfx (hanya log)", header, nullptr);
                     YIELD_GFX();
                 }
                 break;
@@ -1738,7 +1887,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                u64 bb_stall = 0;
+                bool bb_yielded = !BbComputePart('e'); // bbport-order-win (114)
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    if (BbOrderStall(bb_stall, "WaitRegMem gfx", header,
+                                     BB_ORDER_WRM_MEM(wait_reg_mem))) {
+                        break;
+                    }
+                    if (!bb_yielded) { // bbport-order-win (114): the other queues first
+                        bb_yielded = true;
+                        YIELD_GFX();
+                        continue;
+                    }
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                         continue;
@@ -1869,7 +2029,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
-        if (rasterizer) {
+        if (rasterizer && !(BbComputePart('a') && queue.tmp_dwords == 0 &&
+                            BbComputePacketPipelined(acb))) { // bbport-order-win (114)
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // bbport: compute work uses the caches
         }
 
@@ -1949,8 +2110,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                       dma_data->data, false);
+                // bbport-order-win (111): a write into the command buffer being decoded (the
+                // valid bit of a REWIND) must reach guest memory, which this thread reads.
+                const VAddr bb_dst = dma_data->DstAddress<VAddr>();
+                const u32 bb_bytes = dma_data->NumBytes();
+                if (bb_dst >= base_addr && bb_dst + bb_bytes <= base_addr + acb_size) {
+                    static std::atomic<u32> bb_told{0};
+                    if (bb_told.fetch_add(1) == 0) {
+                        std::fprintf(stderr, "bbport-order (111): DMA_DATA ke command buffer "
+                                     "compute (%#llx, %u byte, %08x) ditulis langsung\n",
+                                     (unsigned long long)bb_dst, bb_bytes, dma_data->data);
+                        std::fflush(stderr);
+                    }
+                    for (u32 i = 0; i < bb_bytes / 4; ++i) {
+                        reinterpret_cast<volatile u32*>(bb_dst)[i] = dma_data->data;
+                    }
+                } else {
+                    rasterizer->FillBuffer(bb_dst, bb_bytes, dma_data->data, false);
+                }
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
@@ -1986,7 +2163,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            u64 bb_stall = 0;
             while (!rewind->Valid()) {
+                if (BbOrderStall(bb_stall, "Rewind asc (hanya log)", header, nullptr)) {
+                    BbOrderAscDump(header);
+                    BbOrderRewindCtx(header, acb, vqid);
+                }
                 YIELD_ASC(vqid);
             }
             break;
@@ -2093,7 +2275,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                u64 bb_stall = 0;
                 while (!mem_semaphore->Signaled()) {
+                    if (BbOrderStall(bb_stall, "MemSemaphore asc", header, nullptr)) {
+                        break;
+                    }
                     YIELD_ASC(vqid);
                 }
                 mem_semaphore->Decrement();
@@ -2103,7 +2289,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            u64 bb_stall = 0;
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (BbOrderStall(bb_stall, "WaitRegMem asc", header,
+                                 BB_ORDER_WRM_MEM(wait_reg_mem))) {
+                    break;
+                }
                 // BB_HONEST_LABELS: the value may come from a fence waiting for work not
                 // submitted yet; this thread would spin on it forever.
                 if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
@@ -2346,6 +2537,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    BbOrderAscNote(gnm_vqid, acb);
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};

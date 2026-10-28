@@ -732,6 +732,7 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
         Common::SetCurrentThreadName(name);
     }
     Worker& worker = *workers[index];
+    BbThreads::RaiseHostPriority(); // bbport-order-win (112)
     std::vector<std::unique_ptr<RecordChunk>> ordered;
     const auto has_work = [&] {
         return !worker.queue.empty() || OrderedReady();

@@ -27,9 +27,7 @@ import zipfile
 import zlib
 
 HERE = Path(__file__).resolve().parent
-# In the repository (order1886/ beside build.sh) or beside it (G:\Project\order-win).
-ROOT = Path(os.environ.get('ORDER_PORT', HERE.parent if (HERE.parent / 'build.sh').is_file()
-                           else r'G:\Project\order-win'))
+ROOT = Path(os.environ.get('ORDER_PORT', r'G:\Project\order-win'))
 LAUNCHER_SRC = HERE / 'order_launcher_win.pyw'
 PATCH_SRC = HERE / 'order_windows_patch.py'
 SOURCES = [PATCH_SRC, HERE / 'order_patch.py', HERE / 'order_patches.py', HERE / 'order_run.py']
@@ -51,8 +49,13 @@ SYSTEM_DLLS = {'kernel32', 'user32', 'gdi32', 'advapi32', 'shell32', 'ole32', 'o
                'dinput8', 'xinput1_4', 'ucrtbase', 'vcruntime140', 'msvcp140', 'winspool',
                'cryptbase', 'sspicli', 'wintrust', 'rtworkq', 'ksuser', 'wevtapi', 'ntmarta'}
 FORBIDDEN = re.compile(r'(^|[\\/])(eboot\.bin|eboot\.elf|boot[-\w]*\.bin|content\.bin|patches\.bin|'
-                       r'param\.sfo|icon0\.png|.*\.sprx|.*\.prx|.*_play\.log|prepare\.log|patch\.log|launcher\.json|bbport\.ini)$',
+                       r'param\.sfo|icon0\.png|.*\.sprx|.*\.prx|.*_play\.log|prepare\.log|patch\.log|launcher\.json|bbport\.ini)$'
+                       r'|(^|[\\/])(user|savedata)[\\/]',   # saves and the shader cache (28 Oct)
                        re.IGNORECASE)
+# The player's own data in an existing portable folder: never moved. The package is assembled and
+# zipped in <dist>/launcher-build/package, then only the package files of the play folder are replaced (28 Oct:
+# rebuilding had deleted the saves; a power cut while they were set aside stranded them).
+KEEP = ('user', 'out', 'launcher.json', 'bbport.ini', 'order_play.log')
 
 README = r'''The Order: 1886 - native PC port for Windows (portable)
 =======================================================
@@ -238,7 +241,12 @@ def main():
     print('== Launcher (PyInstaller)')
     launcher = build_launcher(a.dist / 'launcher-build')
 
-    folder = a.dist / NAME
+    # The package is assembled and zipped in a separate folder; the play folder is then updated in
+    # place. The player's data (saves, settings, game image: KEEP) never moves, so a power cut or a
+    # crash during packaging cannot strand it.
+    play = a.dist / NAME
+    recover_keep(play, a.dist / f'{NAME}-keep')   # data set aside by the older packager
+    folder = a.dist / 'launcher-build' / 'package' / NAME   # not beside the play folder: not to be started
     print(f'== Assembling {folder}')
     shutil.rmtree(folder, ignore_errors=True)
     if folder.exists():
@@ -289,13 +297,72 @@ def main():
     print(f'== Zipping {archive}')
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for path in sorted(folder.rglob('*')):
-            if path.is_file():
-                z.write(path, f'{NAME}/{path.relative_to(folder).as_posix()}')
+            rel = path.relative_to(folder)
+            if not path.is_file() or (rel.parts[0] in KEEP and rel.parts[0] != 'out'):
+                continue
+            if FORBIDDEN.search(str(path)):
+                sys.exit(f'Game or personal file in the package, stopping: {rel}')
+            z.write(path, f'{NAME}/{rel.as_posix()}')
     digest = hashlib.sha256(archive.read_bytes()).hexdigest().upper()
     (a.dist / f'{archive.name}.sha256').write_text(f'{digest}  {archive.name}\n')
+    update_play_folder(folder, play)
+    shutil.rmtree(folder, ignore_errors=True)
     print(f'{archive}  {archive.stat().st_size / 1e6:.1f} MB  {len(dlls)} DLLs  {version}')
     print(f'SHA256 {digest}')
-    print(f'Folder to test: {folder}\\{LAUNCHER}.exe')
+    print(f'Folder to test: {play}\\{LAUNCHER}.exe')
+
+
+def recover_keep(play, keep):
+    """The older packager moved KEEP aside while zipping; a run cut short (power cut, 28 Oct) left it
+    there. Put it back before anything else; the play folder's own copy wins if both exist."""
+    if not keep.is_dir():
+        return
+    play.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for src in sorted(keep.iterdir()):
+        dst = play / src.name
+        if src.is_dir():
+            for path in sorted(src.rglob('*')):
+                target = dst / path.relative_to(src)
+                if path.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(path), str(target))
+        elif not dst.exists():
+            shutil.move(str(src), str(dst))
+        moved.append(src.name)
+    shutil.rmtree(keep, ignore_errors=True)
+    if moved:
+        print(f'== Put back from an earlier run into {play}: {", ".join(moved)}')
+
+
+def update_play_folder(new, play):
+    """Replaces the package files of the play folder with the new ones; KEEP (saves, settings, game
+    image) stays where it is. out/ is the game image: only the package's own files in it are updated."""
+    play.mkdir(parents=True, exist_ok=True)
+    for old in play.iterdir():
+        if old.name in KEEP:
+            continue
+        if old.is_dir():
+            shutil.rmtree(old)
+        else:
+            old.unlink()
+    for item in new.iterdir():
+        dst = play / item.name
+        if item.name == 'out' and item.is_dir():   # the package's own files in the game image folder
+            dst.mkdir(exist_ok=True)
+            for f in item.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, dst / f.name)
+        elif item.name in KEEP:                     # never the package's: player data
+            continue
+        elif item.is_dir():
+            shutil.copytree(item, dst)
+        else:
+            shutil.copy2(item, dst)
+    kept = [n for n in KEEP if (play / n).exists()]
+    print(f'== Updated {play}; untouched: {", ".join(kept) or "-"}')
 
 
 if __name__ == '__main__':
