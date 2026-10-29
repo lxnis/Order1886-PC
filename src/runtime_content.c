@@ -94,7 +94,9 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
 }
 static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
     require_initialized();
-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
+    if (service) { /* bbport-order-win (116): same offline list as label 0 */
+        static int noted; if (!noted) { noted=1; printf("bbport-order-win (116): AppContent service label %u -> daftar add-on label 0\n",service); }
+    }
     if ((!capacity || !list) && !hits) return PARAMETER;
     ++lists;
     /* Without a list: the number of add-ons. With one: up to capacity entries, never touching

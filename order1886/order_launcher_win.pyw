@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -48,6 +49,13 @@ else:
 OUT, USER, LOG = DATA / 'out', DATA / 'user', DATA / 'order_play.log'
 CONF, INI = DATA / 'launcher.json', DATA / 'bbport.ini'
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+# Saves outside the portable folder (29 Oct): every launcher version reads and writes the same
+# place, so a new download or a rebuilt folder finds the progress without copying anything.
+# user\savedata stays the game's working copy; the launcher syncs it (newest wins) before Play
+# and after the game exits, and keeps the replaced copy in backup\.
+SAVE_HOME = Path(os.environ.get('ORDER_SAVE_HOME') or
+                 Path(os.environ.get('USERPROFILE', str(Path.home()))) / 'Saved Games' / 'The Order 1886 PC')
+SAVE_KEEP_BACKUPS = 5
 
 FPS = ['30', '60']        # 60 = maximum (above it the game logic breaks; QTE in chapters 6/9: use 30)
 RES = {'1080p (native)': 'native', '2K (2560x1440)': '2560x1440', '4K (3840x2160)': '3840x2160'}
@@ -120,6 +128,72 @@ def find_python():
     return None
 
 
+def save_files(root):
+    """Save files of the game under root (a savedata folder): .../1/CUSA00035/<slot>/..."""
+    out = []
+    for tid in TITLE_IDS:
+        for d in (root.glob(f'*/{tid}') if root.is_dir() else ()):
+            out += [f for f in d.rglob('*') if f.is_file()]
+    return out
+
+
+def save_time(root):
+    """Newest modification time of the saves under root (0 = none)."""
+    return max((f.stat().st_mtime for f in save_files(root)), default=0)
+
+
+def copy_saves(src, dst, backup_dir=None):
+    """Replaces the game's save folders under dst with src's (dst's old ones to backup_dir first)."""
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    for tid in TITLE_IDS:
+        for s in src.glob(f'*/{tid}'):
+            user = s.parent.name
+            d = dst / user / tid
+            tmp = dst / user / f'{tid}.new'
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.copytree(s, tmp)
+            if d.exists():
+                if backup_dir is not None:
+                    b = backup_dir / stamp / user / tid
+                    b.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(d, b, dirs_exist_ok=True)
+                shutil.rmtree(d)
+            tmp.rename(d)
+    if backup_dir is not None and backup_dir.is_dir():
+        old = sorted(p for p in backup_dir.iterdir() if p.is_dir())
+        for p in old[:-SAVE_KEEP_BACKUPS]:
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def find_old_saves(skip):
+    """Saves of other copies of this port (older versions, other downloads): folders with
+    Order1886-Launcher.exe and user\\savedata, up to two levels below each drive, Desktop,
+    Downloads and Documents. Newest first: [(time, savedata folder)]."""
+    places = [Path(f'{c}:\\') for c in 'CDEFGHIJKLMNOPQRSTUVWXYZ' if os.path.isdir(f'{c}:\\')]
+    home = Path(os.environ.get('USERPROFILE', str(Path.home())))
+    places += [home / 'Desktop', home / 'Downloads', home / 'Documents']
+    seen, found = set(), []
+    for place in places:
+        for pattern in ('Order1886-Launcher.exe', '*/Order1886-Launcher.exe', '*/*/Order1886-Launcher.exe'):
+            try:
+                hits = list(place.glob(pattern))
+            except OSError:
+                continue
+            for exe in hits:
+                sd = exe.parent / 'user' / 'savedata'
+                try:
+                    key = str(sd.resolve()).lower()
+                except OSError:
+                    continue
+                if key in seen or key == str(skip.resolve()).lower():
+                    continue
+                seen.add(key)
+                t = save_time(sd)
+                if t:
+                    found.append((t, sd))
+    return sorted(found, reverse=True)
+
+
 def write_ini(path, updates):
     """Rewrites `updates` in the port's bbport.ini and keeps every other line."""
     try:
@@ -184,7 +258,8 @@ class Launcher:
         buttons = ttk.Frame(left)
         buttons.pack(fill='x', pady=(GAP['buttons'], 0))
         for i, (text, cmd) in enumerate((('Log', self.open_log), ('Saves', self.open_saves),
-                                         ('Cache', self.clear_cache), ('Prepare', self.reprepare))):
+                                         ('Import', self.import_saves), ('Cache', self.clear_cache),
+                                         ('Prepare', self.reprepare))):
             buttons.columnconfigure(i, weight=1, uniform='b')
             ttk.Button(buttons, text=text, command=cmd).grid(row=0, column=i, sticky='ew',
                                                              padx=(0 if i == 0 else 12, 0))
@@ -241,6 +316,7 @@ class Launcher:
         root.bind('<Escape>', lambda e: root.destroy())
         self.refresh()
         self.status('EXPERIMENTAL')
+        self.root.after(200, self.startup_saves)
 
     def style(self):
         s = ttk.Style(self.root)
@@ -461,6 +537,7 @@ class Launcher:
         self.save()
         DATA.mkdir(parents=True, exist_ok=True)
         USER.mkdir(parents=True, exist_ok=True)
+        self.sync_saves(quiet=True)
         env = self.launch_env()
         prepare = self.needs_prepare() or self.conf.pop('force_prepare', False)
         self.busy = True
@@ -507,6 +584,7 @@ class Launcher:
         self.busy = False
         self.btn_play.state(['!disabled'])
         self.root.deiconify()
+        self.sync_saves(quiet=True)
         try:
             lines = LOG.read_text(encoding='utf-8', errors='replace').splitlines()
         except OSError:
@@ -518,6 +596,84 @@ class Launcher:
         else:
             self.status(f'Finished (exit code {rc}).')
 
+    # ---- saves ---------------------------------------------------------------------------
+    def sync_saves(self, quiet=False):
+        """Newest wins between user\\savedata (this folder) and SAVE_HOME\\savedata."""
+        local, home = USER / 'savedata', SAVE_HOME / 'savedata'
+        tl, th = save_time(local), save_time(home)
+        try:
+            if th > tl + 2:
+                copy_saves(home, local, SAVE_HOME / 'backup')
+                msg = f'Saves loaded from {SAVE_HOME}.'
+            elif tl > th + 2:
+                copy_saves(local, home, SAVE_HOME / 'backup')
+                msg = f'Saves backed up to {SAVE_HOME}.'
+            else:
+                return
+        except OSError as e:
+            messagebox.showerror(APP, f'Could not sync the saves:\n{e}\n\nThey stay in {local}.')
+            return
+        if not quiet:
+            self.status(msg)
+
+    def startup_saves(self):
+        """First start with no shared saves yet: offer the saves of this folder and of older copies
+        of the port (newest first); with only one copy, take it."""
+        if save_time(SAVE_HOME / 'savedata'):
+            self.sync_saves()
+            return
+        self.status('Looking for saves of an older version…')
+        self.root.update_idletasks()
+        local = USER / 'savedata'
+        found = find_old_saves(local)
+        if save_time(local):
+            found = sorted(found + [(save_time(local), local)], reverse=True)
+        chosen = found[0][1] if len(found) == 1 else None
+        for t, sd in found[:4] if chosen is None else ():
+            when = time.strftime('%d %b %Y %H:%M', time.localtime(t))
+            where = 'this folder' if sd == local else str(sd.parent.parent)
+            if messagebox.askyesno(APP, f'Saves found ({len(found)} copies of the port):\n\n{where}\n'
+                                   f'last saved {when}\n\nUse these?'):
+                chosen = sd
+                break
+        if chosen is None and save_time(local):
+            chosen = local
+        if chosen is None:
+            self.status('No saves yet (new game). Progress is kept in Saved Games\\The Order 1886 PC.')
+            return
+        try:
+            copy_saves(chosen, SAVE_HOME / 'savedata')
+            if chosen != local:
+                copy_saves(SAVE_HOME / 'savedata', local, SAVE_HOME / 'backup')
+        except OSError as e:
+            messagebox.showerror(APP, f'Could not copy the saves:\n{e}')
+            return
+        self.status('Saves: ' + ('this folder' if chosen == local else str(chosen.parent.parent))
+                    + f' (kept in {SAVE_HOME})')
+
+    def import_saves(self):
+        f = filedialog.askdirectory(parent=self.root, title='Select the old port folder (contains user\\savedata)',
+                                    mustexist=True)
+        if not f:
+            return
+        f = Path(f)
+        for sd in (f / 'user' / 'savedata', f / 'savedata', f):
+            if save_time(sd):
+                break
+        else:
+            messagebox.showerror(APP, f'No The Order: 1886 saves in:\n{f}')
+            return
+        if not messagebox.askyesno(APP, f'Replace the current saves with the ones in\n{sd}?\n'
+                                   f'(the current ones go to {SAVE_HOME / "backup"})'):
+            return
+        try:
+            copy_saves(sd, SAVE_HOME / 'savedata', SAVE_HOME / 'backup')
+            copy_saves(SAVE_HOME / 'savedata', USER / 'savedata', SAVE_HOME / 'backup')
+        except OSError as e:
+            messagebox.showerror(APP, f'Could not copy the saves:\n{e}')
+            return
+        self.status(f'Saves imported from {sd}.')
+
     def open_log(self):
         if LOG.exists():
             os.startfile(str(LOG))
@@ -525,8 +681,8 @@ class Launcher:
             messagebox.showinfo(APP, 'No log yet. Play once first.')
 
     def open_saves(self):
-        USER.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(USER))
+        SAVE_HOME.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(SAVE_HOME))
 
     def clear_cache(self):
         for tid in TITLE_IDS:

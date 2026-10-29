@@ -879,6 +879,26 @@ def addr64_opcode_fix_win():
     print('ok addr64_opcode_fix_win (opcodes.inc diperbaiki)')
 
 
+def content_service_label_win():
+    """116. sceAppContentGetAddcontInfoList with a nonzero service label: The Order asks for its
+    add-ons under a second label on some players' runs (a friend's RTX 4070 SUPER, 29 Oct: black
+    screen, log ends "STOP: nonzero AppContent service label unsupported", exit 21). The port has
+    no add-ons under any label: answer the same list as label 0 (offline profile) and log it once."""
+    path = m.BBPORT / 'src' / 'runtime_content.c'
+    text = read(path)
+    if 'bbport-order-win (116)' in text:
+        print('-- content_service_label_win: sudah')
+        return
+    old = '    if (service) { fputs("STOP: nonzero AppContent service label unsupported\\n",stderr); exit(21); }\n'
+    new = ('    if (service) { /* bbport-order-win (116): same offline list as label 0 */\n'
+           '        static int noted; if (!noted) { noted=1; printf("bbport-order-win (116): AppContent service label %u -> daftar add-on label 0\\n",service); }\n'
+           '    }\n')
+    if old not in text:
+        sys.exit('content_service_label_win: titik sisip tidak ditemukan di runtime_content.c')
+    write(path, text.replace(old, new, 1))
+    print('ok content_service_label_win (116)')
+
+
 def order_icon(path):
     """256x256 ICO (PNG inside): dark rounded square, bronze play triangle. No game artwork."""
     import struct
@@ -983,6 +1003,7 @@ def main():
     compute_pipe_win()
     addr64_loads_win()
     addr64_opcode_fix_win()
+    content_service_label_win()
     branding_win()
     print('Selesai (Windows). Build ulang: bash build.sh di MSYS2 CLANG64.')
 
